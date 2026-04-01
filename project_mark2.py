@@ -49,7 +49,10 @@ class BallDropTracker:
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
 
         # Toggle for Kalman filter
-        self.use_kalman = True   # Start with Kalman ON
+        self.use_kalman = True
+
+        # NEW: track whether Kalman has been initialized this loop
+        self.kalman_initialized = False
 
         # Playback control
         self.display_fps = 15.0
@@ -108,6 +111,12 @@ class BallDropTracker:
         print("  , / . : Min Velocity Threshold ±500 px/s")
         print("=================")
 
+    def reset_kalman(self):
+        """Force Kalman to zero position and zero velocity. Called on EVERY loop start."""
+        self.kalman.statePost = np.zeros((4, 1), np.float32)   # [x, y, vx, vy] = 0
+        self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
+        self.kalman_initialized = False                        # Force fresh init on first detection
+
     def process_frame(self, frame: np.ndarray, current_frame_num: int) -> Tuple[np.ndarray, np.ndarray]:
         original = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -136,7 +145,6 @@ class BallDropTracker:
             processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
             processed = cv2.dilate(processed, kernel, iterations=2)
 
-        # Apply left ROI mask
         processed[:, :self.roi_left] = 0
 
         self.detect_and_track(processed, original)
@@ -172,36 +180,39 @@ class BallDropTracker:
         cy = int(M["m01"] / M["m00"])
 
         if self.use_kalman:
-            # Kalman Filter ON
             measurement = np.array([[np.float32(cx)], [np.float32(cy)]], np.float32)
-            self.kalman.predict()
-            corrected = self.kalman.correct(measurement)
 
-            cx_k = int(corrected[0][0])
-            cy_k = int(corrected[1][0])
-            vx_k = self.kalman.statePost[2][0] * self.original_fps
-            vy_k = self.kalman.statePost[3][0] * self.original_fps
+            if not self.kalman_initialized:
+                # First detection after reset → force zero velocity start
+                self.kalman.statePost = np.array([[cx], [cy], [0.0], [0.0]], np.float32)
+                self.kalman_initialized = True
+                vx_k = 0.0
+                vy_k = 0.0
+            else:
+                # Normal operation
+                self.kalman.predict()
+                corrected = self.kalman.correct(measurement)
+                vx_k = self.kalman.statePost[2][0] * self.original_fps
+                vy_k = self.kalman.statePost[3][0] * self.original_fps
+
             self.velocity = (vx_k, vy_k)
-
-            draw_x, draw_y = cx_k, cy_k
+            draw_x, draw_y = int(self.kalman.statePost[0][0]), int(self.kalman.statePost[1][0])
         else:
-            # Kalman Filter OFF - use raw centroid
+            # Raw mode
             if self.prev_centroid is not None:
                 dx = cx - self.prev_centroid[0]
                 dy = cy - self.prev_centroid[1]
                 self.velocity = (dx * self.original_fps, dy * self.original_fps)
             draw_x, draw_y = cx, cy
 
-        # Velocity magnitude check
+        # Safety clamp
         velocity_mag = np.hypot(*self.velocity)
         if velocity_mag < self.min_velocity_threshold:
             self.velocity = (0.0, 0.0)
-            return
 
         self.trajectory.append((draw_x, draw_y))
         self.prev_centroid = (draw_x, draw_y)
 
-        # Visualization
         cv2.circle(original, (draw_x, draw_y), 12, (0, 255, 0), -1)
         cv2.arrowedLine(original, (draw_x, draw_y),
                         (int(draw_x + self.velocity[0]/10), int(draw_y + self.velocity[1]/10)),
@@ -280,19 +291,18 @@ class BallDropTracker:
             self.trajectory.clear()
             self.prev_centroid = None
             self.velocity = (0.0, 0.0)
-            self.kalman.statePost = np.zeros((4, 1), np.float32)   # Reset Kalman state
-            self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
+            self.reset_kalman()
             print("→ Starting cropped collection. Plot will be saved at the end.")
 
-        elif key == ord('x'):   # Start crop
+        elif key == ord('x'):
             self.crop_start_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
             print(f"Crop START marked at frame {self.crop_start_frame}")
 
-        elif key == ord('c'):   # End crop
+        elif key == ord('c'):
             self.crop_end_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
             print(f"Crop END marked at frame {self.crop_end_frame}")
 
-        elif key == ord('f'):   # Toggle Kalman
+        elif key == ord('f'):
             self.use_kalman = not self.use_kalman
             print(f"Kalman Filter: {'ON' if self.use_kalman else 'OFF'}")
 
@@ -302,6 +312,7 @@ class BallDropTracker:
             self.trajectory.clear()
             self.prev_centroid = None
             self.velocity = (0.0, 0.0)
+            self.reset_kalman()
             print(f"Mode → {self.motion_mode.upper()}")
 
         # Left ROI tuning
@@ -407,9 +418,9 @@ class BallDropTracker:
                     self.trajectory.clear()
                     self.prev_centroid = None
                     self.velocity = (0.0, 0.0)
+                    self.reset_kalman()          # ← every loop
                     continue
 
-                # Check if we reached the end of the crop
                 if self.crop_end_frame is not None and frame_counter >= self.crop_end_frame:
                     if self.collecting_full_loop:
                         print("Cropped segment completed → saving plot")
@@ -423,6 +434,7 @@ class BallDropTracker:
                     self.trajectory.clear()
                     self.prev_centroid = None
                     self.velocity = (0.0, 0.0)
+                    self.reset_kalman()          # ← every loop
                     continue
 
                 original_annotated, motion_color = self.process_frame(frame, frame_counter)

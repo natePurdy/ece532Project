@@ -4,7 +4,7 @@ import time
 from collections import deque
 from typing import Tuple, Optional, List
 import matplotlib
-matplotlib.use("TkAgg")
+matplotlib.use("TkAgg")  # gotta use TkAgg or the plots get angry on some systems
 import matplotlib.pyplot as plt
 
 
@@ -14,13 +14,13 @@ class BallDropTracker:
         self.cap = cv2.VideoCapture(video_path)
         
         if not self.cap.isOpened():
-            raise ValueError("Could not open video file.")
+            raise ValueError("Could not open video file.")  # classic "did you give me a real video?" check
 
         self.original_fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Processing parameters
+        # Processing parameters - these are the knobs I'll be fiddling with forever
         self.canny_low = 30
         self.canny_high = 120
         self.blur_kernel_size = 9
@@ -29,18 +29,19 @@ class BallDropTracker:
         self.min_contour_area = 150
         self.morph_kernel_size = 5
 
-        # ROI to exclude release mechanism (left side)
+        # ROI to exclude the release mechanism on the left side (don't track the launcher!)
         self.roi_left = 300
 
-        self.min_velocity_threshold = 0
+        self.min_velocity_threshold = 0   # ignore tiny movements that are probably noise
 
         self.use_opencv_canny = True
-        self.motion_mode = "frame_diff"
+        self.motion_mode = "frame_diff"   # start with frame differencing, can flip to Canny
 
-        # Kalman filter
-        self.kalman = cv2.KalmanFilter(4, 2)
-        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+        # Kalman filter setup - the "make it less jittery" magic
+        self.kalman = cv2.KalmanFilter(4, 2)  # 4 states (x,y,vx,vy), 2 measurements (x,y)
+        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0], 
+                                                  [0, 1, 0, 0]], np.float32)
+        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0],   # constant velocity model
                                                  [0, 1, 0, 1],
                                                  [0, 0, 1, 0],
                                                  [0, 0, 0, 1]], np.float32)
@@ -48,34 +49,31 @@ class BallDropTracker:
         self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
 
-        # Toggle for Kalman filter
         self.use_kalman = True
+        self.kalman_initialized = False   # NEW: helps us reset cleanly each loop
 
-        # NEW: track whether Kalman has been initialized this loop
-        self.kalman_initialized = False
-
-        # Playback control
-        self.display_fps = 15.0
+        # Playback control stuff
+        self.display_fps = 15.0           # start slower than real speed so we can actually see things
         self.min_fps = 1.0
         self.max_fps = 120.0
         self.fps_step = 5.0
 
         # Tracking state
         self.prev_gray: Optional[np.ndarray] = None
-        self.trajectory = deque(maxlen=80)
+        self.trajectory = deque(maxlen=80)   # keep last 80 points for the trail
         self.prev_centroid: Optional[Tuple[int, int]] = None
         self.velocity = (0.0, 0.0)
 
-        # Crop control
+        # Crop control for collecting a specific drop segment
         self.crop_start_frame: Optional[int] = None
         self.crop_end_frame: Optional[int] = None
 
-        # Data collection
+        # Data collection for plotting
         self.collecting_full_loop = False
         self.velocity_history: List[Tuple[float, float]] = []
         self.frame_times: List[float] = []
 
-        # Window setup
+        # Window setup - make it nice and wide
         self.window_name = "Raw (with velocity/trajectory) vs Motion Mask"
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 1800, 700)
@@ -115,17 +113,19 @@ class BallDropTracker:
         """Force Kalman to zero position and zero velocity. Called on EVERY loop start."""
         self.kalman.statePost = np.zeros((4, 1), np.float32)   # [x, y, vx, vy] = 0
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
-        self.kalman_initialized = False                        # Force fresh init on first detection
+        self.kalman_initialized = False   # force fresh init on first detection
 
     def process_frame(self, frame: np.ndarray, current_frame_num: int) -> Tuple[np.ndarray, np.ndarray]:
         original = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), self.blur_sigma)
 
+        # Motion detection - two different modes because sometimes one sucks
         if self.motion_mode == "canny":
             if self.use_opencv_canny:
                 processed = cv2.Canny(blurred, self.canny_low, self.canny_high)
             else:
+                # manual canny attempt (rarely used)
                 grad_x = cv2.Sobel(blurred, cv2.CV_64F, 1, 0, ksize=3)
                 grad_y = cv2.Sobel(blurred, cv2.CV_64F, 0, 1, ksize=3)
                 grad_mag = np.sqrt(grad_x**2 + grad_y**2)
@@ -134,25 +134,29 @@ class BallDropTracker:
                 _, weak = cv2.threshold(grad_mag, self.canny_low, 255, cv2.THRESH_BINARY)
                 processed = cv2.bitwise_and(strong, weak)
         else:
+            # Frame differencing + morphology - usually more reliable for this
             if self.prev_gray is None:
                 self.prev_gray = blurred.copy()
             diff = cv2.absdiff(self.prev_gray, blurred)
             _, processed = cv2.threshold(diff, self.motion_thresh, 255, cv2.THRESH_BINARY)
             self.prev_gray = blurred.copy()
 
+            # Clean up the mask a bit
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
-            processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel)
-            processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
-            processed = cv2.dilate(processed, kernel, iterations=2)
+            processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel, iterations=2)  # fill holes
+            processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel, iterations=1)   # clean noise
 
+        # Zero out the left side (where the release mechanism is)
         processed[:, :self.roi_left] = 0
 
         self.detect_and_track(processed, original)
 
+        # If we're in data collection mode, save velocity over time
         if self.collecting_full_loop and self.prev_centroid is not None:
             self.velocity_history.append(self.velocity)
             self.frame_times.append(current_frame_num / self.original_fps)
 
+        # Draw current velocity on the frame
         cv2.putText(original, f"Vel: {self.velocity[0]:.0f}, {self.velocity[1]:.0f} px/s", 
                     (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
 
@@ -166,6 +170,7 @@ class BallDropTracker:
             self.velocity = (0.0, 0.0)
             return
 
+        # Grab the biggest blob and hope it's the ball
         largest = max(contours, key=cv2.contourArea)
         if cv2.contourArea(largest) < self.min_contour_area:
             self.velocity = (0.0, 0.0)
@@ -183,13 +188,12 @@ class BallDropTracker:
             measurement = np.array([[np.float32(cx)], [np.float32(cy)]], np.float32)
 
             if not self.kalman_initialized:
-                # First detection after reset → force zero velocity start
+                # First time seeing the ball after reset → assume it starts with zero velocity
                 self.kalman.statePost = np.array([[cx], [cy], [0.0], [0.0]], np.float32)
                 self.kalman_initialized = True
                 vx_k = 0.0
                 vy_k = 0.0
             else:
-                # Normal operation
                 self.kalman.predict()
                 corrected = self.kalman.correct(measurement)
                 vx_k = self.kalman.statePost[2][0] * self.original_fps
@@ -198,31 +202,35 @@ class BallDropTracker:
             self.velocity = (vx_k, vy_k)
             draw_x, draw_y = int(self.kalman.statePost[0][0]), int(self.kalman.statePost[1][0])
         else:
-            # Raw mode
+            # No Kalman = raw centroid differencing (more noisy)
             if self.prev_centroid is not None:
                 dx = cx - self.prev_centroid[0]
                 dy = cy - self.prev_centroid[1]
                 self.velocity = (dx * self.original_fps, dy * self.original_fps)
             draw_x, draw_y = cx, cy
 
-        # Safety clamp
+        # Ignore super tiny velocities (noise)
         velocity_mag = np.hypot(*self.velocity)
         if velocity_mag < self.min_velocity_threshold:
             self.velocity = (0.0, 0.0)
 
+        # Update trajectory and previous position
         self.trajectory.append((draw_x, draw_y))
         self.prev_centroid = (draw_x, draw_y)
 
-        cv2.circle(original, (draw_x, draw_y), 12, (0, 255, 0), -1)
+        # Draw stuff on the original frame
+        cv2.circle(original, (draw_x, draw_y), 12, (0, 255, 0), -1)                    # big green dot
         cv2.arrowedLine(original, (draw_x, draw_y),
                         (int(draw_x + self.velocity[0]/10), int(draw_y + self.velocity[1]/10)),
-                        (0, 0, 255), 3, tipLength=0.4)
+                        (0, 0, 255), 3, tipLength=0.4)                                 # red velocity arrow
 
+        # Draw the trajectory trail
         if len(self.trajectory) > 1:
             pts = np.array(self.trajectory, dtype=np.int32)
-            cv2.polylines(original, [pts], False, (255, 255, 0), 3)
+            cv2.polylines(original, [pts], False, (255, 255, 0), 3)   # yellow line
 
     def plot_velocity(self):
+        """Make a nice plot of the collected velocity data from the cropped segment"""
         if len(self.velocity_history) < 5:
             print("Not enough valid data collected.")
             return
@@ -233,7 +241,7 @@ class BallDropTracker:
 
         if t:
             t0 = t[0]
-            t = [ti - t0 for ti in t]
+            t = [ti - t0 for ti in t]   # make time start at 0
 
         print(f"Plotting cropped segment with {len(t)} points...")
 
@@ -266,6 +274,7 @@ class BallDropTracker:
         print("You can open the PNG file to view it.\n")
 
     def handle_keyboard(self, key: int) -> bool:
+        """Handle all the key presses. This thing got long because there are a lot of tuning keys lol"""
         if key == ord('q'):
             return True
 
@@ -406,6 +415,7 @@ class BallDropTracker:
             if not self.paused:
                 ret, frame = self.cap.read()
                 if not ret:
+                    # video ended → loop back to start (or crop start)
                     if self.collecting_full_loop:
                         print("Cropped segment completed → saving plot")
                         self.plot_velocity()
@@ -418,9 +428,10 @@ class BallDropTracker:
                     self.trajectory.clear()
                     self.prev_centroid = None
                     self.velocity = (0.0, 0.0)
-                    self.reset_kalman()          # ← every loop
+                    self.reset_kalman()          # important: reset every time we loop
                     continue
 
+                # stop at crop end if we're collecting
                 if self.crop_end_frame is not None and frame_counter >= self.crop_end_frame:
                     if self.collecting_full_loop:
                         print("Cropped segment completed → saving plot")
@@ -434,11 +445,12 @@ class BallDropTracker:
                     self.trajectory.clear()
                     self.prev_centroid = None
                     self.velocity = (0.0, 0.0)
-                    self.reset_kalman()          # ← every loop
+                    self.reset_kalman()
                     continue
 
                 original_annotated, motion_color = self.process_frame(frame, frame_counter)
 
+                # side-by-side display
                 combined = np.hstack((original_annotated, motion_color))
                 target_width = 1800
                 scale = target_width / combined.shape[1]
@@ -448,6 +460,7 @@ class BallDropTracker:
                 cv2.imshow(self.window_name, combined)
                 frame_counter += 1
 
+            # FPS control
             current_time = time.time()
             elapsed = current_time - self.last_frame_time
             if not self.paused and elapsed < self.frame_delay:

@@ -44,7 +44,7 @@ class BallDropTracker:
         self.roi_bottom = 0
         # Dynamic tracking box around the ball (to reduce background motion noise)
         self.tracking_box_base_size = 200      # smallest box when very confident
-        self.tracking_box_max_size = 1000       # largest box when uncertain
+        self.tracking_box_max_size = 900       # largest box when uncertain
         self.tracking_box = None
         self.current_tracking_box_size = self.tracking_box_max_size # start 
 
@@ -56,19 +56,31 @@ class BallDropTracker:
 
         #  ----------------------- Kalman filter setup  -----------------------
         self.initializeKalmanFilters()
+        self.initializeYoloKalmanFilters()
 
 
-        #  ----------------------- mONOCULAR RANGE ESTIMATION SETUP  -----------------------
+        #  ----------------------- mONOCULAR RANGE and velocity ESTIMATION SETUP using classical methods -----------------------
         self.focal_length_px = 1641      # based on physical camera lens (calculated using "calibrateCam.py")
         self.ball_real_diam_m = 0.067 # tennis ball size meters     
         self.range: float = 2.0
+        self.range_rate: float = 0.0
         self.prev_Z_raw: Optional[float] = None
         self.prev_range: Optional[float] = None # 
         self.prev_diam: Optional[float] = None
         self.vx_mps: float = 0.0 # velocity in meters per second, x direction
         self.vy_mps: float = 0.0 # velocity in meters per second, y direction
-        self.range_rate: float = 0.0   
-        # monocular x and Y velocity stuff based on range
+
+        # ---------------------- YOLO-BASED RANGE ESTIMATION (NN based approach and/or supplementation to classical methods) -------------------------
+        self.yolo_range: float = 2.0
+        self.yolo_range_rate: float = 0.0
+        self.prev_yolo_Z_raw: Optional[float] = None
+        # yolo based velocity estimation using the range (might as well)
+        self.yolo_centroid: Optional[Tuple[int, int]] = None
+        self.prev_yolo_centroid: Optional[Tuple[int, int]] = None
+        self.yolo_pixVelocity = (0.0, 0.0)
+        self.yolo_vx_mps: float = 0.0
+        self.yolo_vy_mps: float = 0.0
+           
         # ----------------------        Playback control         -----------------------
         self.display_fps = 15.0
         self.min_fps = 1.0
@@ -95,6 +107,13 @@ class BallDropTracker:
         self.frame_times: List[float] = []  # times for frame capture
         self.vx_mps_history: List[float] = []   # vx m/s
         self.vy_mps_history: List[float] = []    # vy m/s
+        # also for yolo
+        self.yolo_frame_times: List[float] = []
+        self.yolo_pixVelocity_history: List[Tuple[float, float]] = [] # x and y pixel velocity
+        self.yolo_vx_mps_history: List[float] = [] 
+        self.yolo_vy_mps_history: List[float] = [] 
+        self.yolo_range_history: List[float] = [] 
+        self.yolo_range_rate_history: List[float] = [] 
 
         # Window setup
         self.window_name =f"Ball Tracker mk3"
@@ -126,8 +145,9 @@ class BallDropTracker:
 
 
         # timing stuff
-        self.current_frameProcessing_time = 0.0
-        self.current_yoloPrediction_time = 0.0
+        self.current_classicalProcessing_time = 0.0  # time to perform object tracking / monocular range and velocity estimation 
+        self.current_yoloProcessing_time = 0.0  # time to make classicication prediction
+        self.current_total_processing_time = 0.0 # time to do all processing on a frame
 
         
 
@@ -222,9 +242,10 @@ class BallDropTracker:
         except Exception as e:
             print(f"Error loading {model_path}: {e}")
     # kalman filter needs to be reset every video loop (and probably other times too...)
-    # dirty reset, just copy the init section
+    # dirty and hard and greasy reset on these bad boys
     def initializeKalmanFilters(self):
-        # kalman pixel velocities (4 states, position x and y, and velcocity x and y)
+        """Classical Kalman filters (pixel + range)"""
+        # Pixel Kalman (x, y, vx, vy)
         self.kalman_pixel = cv2.KalmanFilter(4, 2)
         self.kalman_pixel.measurementMatrix = np.array([[1, 0, 0, 0], 
                                                   [0, 1, 0, 0]], np.float32)
@@ -236,17 +257,164 @@ class BallDropTracker:
         self.kalman_pixel.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
         self.kalman_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 50
 
-        # Range mode Kalman (Z, vZ) - simpler 2-state filter
+        # Range Kalman (Z, vZ)
         self.kalman_range = cv2.KalmanFilter(2, 1)
-        self.kalman_range.measurementMatrix = np.array([[1, 0]], np.float32)          # measure only position
-        self.kalman_range.transitionMatrix = np.array([[1, 1/self.original_fps],      # dt = 1/FPS
+        self.kalman_range.measurementMatrix = np.array([[1, 0]], np.float32)
+        self.kalman_range.transitionMatrix = np.array([[1, 1/self.original_fps],
                                                        [0, 1]], np.float32)
         self.kalman_range.processNoiseCov = np.array([[0.1, 0.0],
-                                                      [0.0,  5]], dtype=np.float32) *1      # good range estimate is assumed in order to not have 
-        self.kalman_range.measurementNoiseCov = np.array([[1.0]], np.float32) *1        # range measurement noise
+                                                      [0.0,  5]], dtype=np.float32) * 1
+        self.kalman_range.measurementNoiseCov = np.array([[1.0]], np.float32) * 1
         self.kalman_range.errorCovPost = np.eye(2, dtype=np.float32) * 50
+
         self.use_kalman = True
         self.kalman_initialized = True
+
+
+    def initializeYoloKalmanFilters(self):
+        """Separate Kalman filters for YOLO-based tracking (pixel + range)"""
+        # YOLO Pixel Kalman (x, y, vx, vy)
+        self.kalman_yolo_pixel = cv2.KalmanFilter(4, 2)
+        self.kalman_yolo_pixel.measurementMatrix = np.array([[1, 0, 0, 0], 
+                                                    [0, 1, 0, 0]], np.float32)
+        self.kalman_yolo_pixel.transitionMatrix = np.array([[1, 0, 1, 0],
+                                                    [0, 1, 0, 1],
+                                                    [0, 0, 1, 0],
+                                                    [0, 0, 0, 1]], np.float32)
+        self.kalman_yolo_pixel.processNoiseCov = np.eye(4, dtype=np.float32) * 1.0
+        self.kalman_yolo_pixel.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
+        self.kalman_yolo_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 50
+
+        # YOLO Range Kalman (Z, vZ)
+        self.kalman_yolo_range = cv2.KalmanFilter(2, 1)
+        self.kalman_yolo_range.measurementMatrix = np.array([[1, 0]], np.float32)
+        self.kalman_yolo_range.transitionMatrix = np.array([[1, 1/self.original_fps],
+                                                    [0, 1]], np.float32)
+        self.kalman_yolo_range.processNoiseCov = np.array([[0.1, 0.0],
+                                                    [0.0,  5]], dtype=np.float32) * 1
+        self.kalman_yolo_range.measurementNoiseCov = np.array([[1.0]], np.float32) * 1
+        self.kalman_yolo_range.errorCovPost = np.eye(2, dtype=np.float32) * 50
+
+        self.use_yolo_kalman = True
+        self.yolo_kalman_initialized = True
+
+    def compute_yolo_range(self, result, current_frame_num: int, display_img: np.ndarray, roi_offset: Tuple[int, int] = (0, 0)):
+        """YOLO segmentation → min enclosing circle → Kalman-smoothed range + velocities.
+        Draws on the right YOLO panel."""
+        if not hasattr(result, 'masks') or result.masks is None or len(result.masks.data) == 0:
+            return
+
+        mask = result.masks.data[0].cpu().numpy()
+        mask = (mask > 0.5).astype(np.uint8) * 255
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < 80:
+            return
+
+        (cx, cy), radius = cv2.minEnclosingCircle(largest)
+        pixel_diam = 2 * radius
+
+        ox, oy = roi_offset
+        center = (int(cx + ox), int(cy + oy))
+        r = int(radius)
+
+        cv2.circle(display_img, center, r, (0, 255, 255), 3)   # cyan circle
+        cv2.circle(display_img, center, 6, (0, 255, 0), -1)    # green dot
+
+        # ====================== RANGE (Kalman smoothed) ======================
+        if pixel_diam > 8:
+            Z_raw = (self.focal_length_px * self.ball_real_diam_m) / pixel_diam
+        else:
+            Z_raw = self.yolo_range
+
+        if self.use_yolo_kalman:
+            measurement = np.array([[np.float32(Z_raw)]], np.float32)
+            if not self.yolo_kalman_initialized:
+                self.initializeYoloKalmanFilters()
+                self.kalman_yolo_range.statePost = np.array([[Z_raw], [0.0]], np.float32)
+                self.yolo_kalman_initialized = True
+                self.yolo_range = Z_raw
+                self.yolo_range_rate = 0.0
+            else:
+                self.kalman_yolo_range.predict()
+                self.kalman_yolo_range.correct(measurement)
+                self.yolo_range = float(self.kalman_yolo_range.statePost[0][0])
+                self.yolo_range_rate = float(self.kalman_yolo_range.statePost[1][0])
+        else:
+            # raw (no Kalman)
+            if self.prev_yolo_Z_raw is not None:
+                dt = 1.0 / self.original_fps
+                self.yolo_range_rate = (Z_raw - self.prev_yolo_Z_raw) / dt
+            else:
+                self.yolo_range_rate = 0.0
+            self.yolo_range = Z_raw
+            self.prev_yolo_Z_raw = Z_raw
+
+        # ====================== PIXEL + REAL VELOCITY (Kalman smoothed) ======================
+        if self.use_yolo_kalman:
+            meas = np.array([[np.float32(center[0])], [np.float32(center[1])]], np.float32)
+            if not self.yolo_kalman_initialized:
+                self.kalman_yolo_pixel.statePost = np.array([[center[0]], [center[1]], [0.0], [0.0]], np.float32)
+                self.yolo_kalman_initialized = True
+                self.yolo_pixVelocity = (0.0, 0.0)
+            else:
+                self.kalman_yolo_pixel.predict()
+                self.kalman_yolo_pixel.correct(meas)
+                vx_px = self.kalman_yolo_pixel.statePost[2][0] * self.original_fps
+                vy_px = self.kalman_yolo_pixel.statePost[3][0] * self.original_fps
+                self.yolo_pixVelocity = (vx_px, vy_px)
+
+            draw_x = int(self.kalman_yolo_pixel.statePost[0][0])
+            draw_y = int(self.kalman_yolo_pixel.statePost[1][0])
+        else:
+            # raw velocity
+            if self.prev_yolo_centroid is not None:
+                dx = center[0] - self.prev_yolo_centroid[0]
+                dy = center[1] - self.prev_yolo_centroid[1]
+                self.yolo_pixVelocity = (dx * self.original_fps, dy * self.original_fps)
+            else:
+                self.yolo_pixVelocity = (0.0, 0.0)
+            draw_x, draw_y = center
+
+        self.yolo_centroid = (draw_x, draw_y)
+        self.prev_yolo_centroid = center
+
+        # Real-world velocities
+        Z_yolo = max(self.yolo_range, 0.1)
+        self.yolo_vx_mps = (self.yolo_pixVelocity[0] * Z_yolo) / self.focal_length_px
+        self.yolo_vy_mps = (self.yolo_pixVelocity[1] * Z_yolo) / self.focal_length_px
+        # ============================================================================
+
+        # Text on YOLO panel
+        cv2.putText(display_img, f"Range: {self.yolo_range:.2f}m", (30, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+        cv2.putText(display_img, f"vr: {self.yolo_range_rate:+.2f} m/s", (30, 115),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+        cv2.putText(display_img, f"Vel: {self.yolo_pixVelocity[0]:.0f}, {self.yolo_pixVelocity[1]:.0f} px/s", (30, 165),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 255, 255), 3)
+        cv2.putText(display_img, f"Vx: {self.yolo_vx_mps:+.2f}   Vy: {self.yolo_vy_mps:+.2f} m/s", (30, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 255, 255), 3)
+
+        if self.use_yolo_kalman:
+            cv2.putText(display_img, "YOLO Kalman ON", (30, 245),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 100), 2)
+        
+        # also collect data for plotting
+        if self.collectingPlotData:
+            current_time = current_frame_num*1/self.original_fps   # or better: use frame number * (1/FPS)
+            self.yolo_frame_times.append(current_time)
+            
+            self.yolo_pixVelocity_history.append(self.yolo_pixVelocity)
+            self.yolo_vx_mps_history.append(self.yolo_vx_mps)
+            self.yolo_vy_mps_history.append(self.yolo_vy_mps)
+            self.yolo_range_history.append(self.yolo_range)
+            self.yolo_range_rate_history.append(self.yolo_range_rate)
+
+            
 
 
     # try using the tracking box to help clean up the segmantation of the object
@@ -305,7 +473,7 @@ class BallDropTracker:
 
     # process a single frame of video (frame by frame logic here)
     def processNextFrame(self, frame: np.ndarray, current_frame_num: int) -> Tuple[np.ndarray, np.ndarray]:
-        start_total = time.time()
+        begin_processing_frame_time = time.time()
 
         # Keep a completely clean copy for YOLO
         clean_frame = frame.copy()
@@ -341,16 +509,19 @@ class BallDropTracker:
         if self.roi_top > 0:    processed[:self.roi_top, :] = 0
         if self.roi_bottom > 0: processed[-self.roi_bottom:, :] = 0
 
-        self.detectAndTrack(processed, original)
+        self.detectAndTrack(processed, original, current_frame_num)
+        about_to_run_yolo_time = time.time()
+        # monocular range and velocity estimation + tracking movement time taken ("classical methods")
+        self.current_classicalProcessing_time = about_to_run_yolo_time - begin_processing_frame_time
 
         # ====================== YOLO (every frame when enabled) ======================
-        yolo_time = 0.0
         if self.yolo_enabled and self.yolo_model is not None:
             start_yolo = time.time()
 
-            frame_for_yolo = clean_frame.copy()   # use the already-annotated frame
+            frame_for_yolo = clean_frame.copy()
+            roi_offset = (0, 0)
 
-            if self.tracking_box is not None:   # faster: run only on tracking box
+            if self.tracking_box is not None:   # faster: run only on tracking box + pad
                 bx, by, bw, bh = self.tracking_box
                 pad = 20
                 x1 = max(0, bx - pad)
@@ -363,28 +534,34 @@ class BallDropTracker:
                                                   verbose=False, retina_masks=True)
                 annotated_roi = results[0].plot()
                 frame_for_yolo[y1:y2, x1:x2] = annotated_roi
+                roi_offset = (x1, y1)
             else:
                 results = self.yolo_model.predict(source=frame_for_yolo, conf=0.25,
                                                   iou=0.45, verbose=False, retina_masks=True)
                 frame_for_yolo = results[0].plot()
 
+            # yolo range estimation, compare of fuse with classical range estimation
+            # (this also draws the cyan circle + text on the right panel)
+            self.compute_yolo_range(results[0], current_frame_num,  frame_for_yolo, roi_offset)
+
             self.yolo_annotated = frame_for_yolo
             yolo_time = time.time() - start_yolo
-
-        self.current_yoloPrediction_time = yolo_time
+            self.current_yoloProcessing_time = yolo_time
+        # ============================================================================
         # ============================================================================
 
         processed_color = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
-        # Final timing
-        self.current_frameProcessing_time = time.time() - start_total
+        # total processing time (all algorithms used on a frame)
+        end_total = time.time()
+        self.current_total_processing_time = end_total - begin_processing_frame_time
 
         return original, processed_color
 
     # this is a hefty one...
     # perform detection of moving objects, and tracking
     #  Two-stage: motion mask ONLY for position tracking, original image + clean segmentation for range
-    def detectAndTrack(self, motion_mask: np.ndarray, original: np.ndarray):
+    def detectAndTrack(self, motion_mask: np.ndarray, original: np.ndarray, current_frame_num: int):
 
         # ------------------- ------------------------------------------Search Region Setup (motion mask) -------------------
         if self.prev_centroid is None: 
@@ -401,7 +578,7 @@ class BallDropTracker:
                 uncertainty2 = np.sqrt(cov2[0,0] + cov2[1,1])
                 # print(uncertainty2)
                 # make the "focusing box" for tracking shrink as a function of object velocicyt and filter confidence
-                self.current_tracking_box_size = int(self.tracking_box_base_size + uncertainty2**3 * np.ceil(np.sqrt(self.vx_mps**2 + self.vy_mps**2))) # simply homecooked function of uncertainty and xy velocity
+                self.current_tracking_box_size = int(self.tracking_box_base_size + uncertainty2**3/2 * np.ceil(np.sqrt(self.vx_mps**2 + self.vy_mps**2))) # simply homecooked function of uncertainty and xy velocity
                 self.current_tracking_box_size = max(self.tracking_box_base_size, min(self.tracking_box_max_size, self.current_tracking_box_size))
             else:
 
@@ -524,7 +701,7 @@ class BallDropTracker:
         self.vx_mps = (self.pixVelocity[0] * Z) / self.focal_length_px
         self.vy_mps = (self.pixVelocity[1] * Z) / self.focal_length_px
 
-        # ====================== DRAWING ======================
+        # DRAWING stuff
         self.trajectory.append((draw_x, draw_y))
         self.prev_centroid = (draw_x, draw_y)
 
@@ -538,23 +715,41 @@ class BallDropTracker:
             pts = np.array(self.trajectory, dtype=np.int32)
             cv2.polylines(original, [pts], False, (255, 255, 0), 3)
 
-        # === LEFT PANEL: Classical tracking info only ===
+        # LEFT PANEL: Classical tracking info only 
         label = (f"Range: {self.range:.2f}m   vr: {self.range_rate:+.2f} m/s\n"
                  f"Vel: {self.pixVelocity[0]:.0f}, {self.pixVelocity[1]:.0f} px/s\n"
                  f"Vx: {self.vx_mps:+.2f} m/s    Vy: {self.vy_mps:+.2f} m/s\n"
-                 f"FrameTime: {self.current_frameProcessing_time*1000:.1f} ms")
+                 f"Detection/Tracking Time: {self.current_classicalProcessing_time*1000:.2f} ms\n")
+        
+        if self.yolo_enabled:
+            label += f"YOLO Prediction Time: {self.current_yoloProcessing_time*1000:.2f} ms\n"
+
+
+        # also add the total processing time
+        label += f"Total System Opration Time: {self.current_total_processing_time*1000:.2f} ms\n"
 
         y_offset = 50
         for i, line in enumerate(label.split('\n')):
             cv2.putText(original, line, (20, y_offset + i*35),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
 
-        cv2.putText(original, "CLASSICAL TRACKING", 
-                    (20, y_offset + 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
 
         status = "Kalman ON" if self.use_kalman else "Kalman OFF (raw)"
         cv2.putText(original, status, (20, y_offset + 215),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 255, 100), 2)
+        
+        # ====================== DATA COLLECTION FOR PLOTTING ======================
+        if self.collectingPlotData:
+            current_time = current_frame_num*1/self.original_fps   # or better: use frame number * (1/FPS)
+            self.frame_times.append(current_time)
+            
+            self.pixVelocity_history.append(self.pixVelocity)
+            self.vx_mps_history.append(self.vx_mps)
+            self.vy_mps_history.append(self.vy_mps)
+            self.range_history.append(self.range)
+            self.range_rate_history.append(self.range_rate)
+
+        # =========================================================================
         
 
     # plot the pixVelocity for a single loop of video
@@ -639,6 +834,90 @@ class BallDropTracker:
         print(f"Combined plot saved as: {plot_filename}")
         print("You can open the PNG file to view Vx/Vy + Range/vr together.\n")
     
+    
+
+    def plot_YOLOcombined_data(self):
+        """Plot all data in one figure:
+        - Top: Vx and Vy (m/s) limited to ±10 m/s
+        - Bottom: Range (m) and Range-rate (m/s)
+        """
+        if len(self.frame_times) < 5:
+            print("Not enough valid data collected (need at least 5 points).")
+            return
+
+        # Prepare time axis (relative to start)
+        t = self.yolo_frame_times
+        if t:
+            t0 = t[0]
+            t = [ti - t0 for ti in t]
+
+        # Prepare real-world velocities (m/s)
+        if hasattr(self, 'yolo_vx_mps_history') and len(self.yolo_vx_mps_history) > 0:
+            vx = self.yolo_vx_mps_history
+            vy = self.yolo_vy_mps_history
+        else:
+            # Fallback
+            vx = []
+            vy = []
+            avg_range = np.mean(self.yolo_range_history) if self.yolo_range_history else 2.0
+            for v in self.yolo_pixVelocity_history:
+                vx.append((v[0] * avg_range) / self.focal_length_px)
+                vy.append((v[1] * avg_range) / self.focal_length_px)
+
+        print(f"Plotting combined data with {len(t)} points...")
+
+        fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+        # ====================== TOP PLOT: Vx and Vy (m/s) with Y-limit ±10 ======================
+        axs[0].scatter(t, vy, c='blue', s=40, alpha=0.8, label='Vy (vertical)')
+        axs[0].plot(t, vy, 'b-', linewidth=1.8, alpha=0.7)
+
+        axs[0].scatter(t, vx, c='red', s=40, alpha=0.8, label='Vx (horizontal)')
+        axs[0].plot(t, vx, 'r-', linewidth=1.8, alpha=0.7)
+
+        axs[0].set_title('yolo - Horizontal and Vertical Velocities (limited to ±10 m/s)', 
+                        fontsize=14, fontweight='bold')
+        axs[0].set_ylabel('Velocity (m/s)', fontsize=12)
+        axs[0].grid(True, alpha=0.3)
+        axs[0].legend(fontsize=11)
+        axs[0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+        # LIMIT Y-AXIS TO ±5 m/s which is about +- 10 miles per hour ( i dont expect fast objects at this point)
+        axs[0].set_ylim(-5, 5)
+
+        # ====================== BOTTOM PLOT: Range and Range-rate ======================
+        ax1 = axs[1]
+        ax1.scatter(t, self.yolo_range_history, c='green', s=40, alpha=0.8, label='Range Z (m)')
+        ax1.plot(t, self.yolo_range_history, 'g-', linewidth=1.8, alpha=0.7)
+        ax1.set_ylabel('Range (meters)', color='green', fontsize=12)
+        ax1.tick_params(axis='y', labelcolor='green')
+
+        ax2 = ax1.twinx()
+        ax2.scatter(t, self.yolo_range_rate_history, c='purple', s=40, alpha=0.8, label='Range-rate vr (m/s)')
+        ax2.plot(t, self.yolo_range_rate_history, 'purple', linewidth=1.8, alpha=0.7)
+        ax2.set_ylabel('Range-rate (m/s)', color='purple', fontsize=12)
+        ax2.tick_params(axis='y', labelcolor='purple')
+
+        ax1.set_title('Range and Range-rate', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Time (seconds)', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+
+        # Combine legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=11, loc='upper right')
+
+        plt.tight_layout()
+
+        # Save the plot
+        plot_filename = f"combined_velocity_range_plot_{time.strftime('%H%M%S')}.png"
+        plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
+        plt.close()
+
+        print(f"Combined plot saved as: {plot_filename}")
+        print("You can open the PNG file to view Vx/Vy + Range/vr together.\n")
+    
+
     # this is horrible dont look inside
     def handleKeyboard(self, key: int) -> bool:
         if key == ord('q'):
@@ -699,6 +978,7 @@ class BallDropTracker:
             self.pixVelocity = (0.0, 0.0)
             if self.use_kalman:
                 self.initializeKalmanFilters() # dont turn on the filters if saving an unfiltered plot...
+                self.initializeYoloKalmanFilters()
             
 
             print(f"→ Starting NEW cropped collection from frame {self.crop_start_frame} "
@@ -721,6 +1001,7 @@ class BallDropTracker:
             self.prev_centroid = None
             self.pixVelocity = (0.0, 0.0)
             self.initializeKalmanFilters()
+            self.initializeYoloKalmanFilters()
             print(f"Mode → {self.motion_mode.upper()}")
 
         elif key == ord('w'):  # Reset all ROI to zero
@@ -819,11 +1100,16 @@ class BallDropTracker:
         elif key == ord('f'):
             self.use_kalman = not self.use_kalman
             print(f"Kalman Filter: {'ON' if self.use_kalman else 'OFF'}")
+        elif key == ord('g'):
+            self.use_yolo_kalman = not self.use_yolo_kalman
+            print(f"YOLO Kalman Filter: {'ON' if self.use_yolo_kalman else 'OFF'}")
+            if self.use_yolo_kalman and not self.yolo_kalman_initialized:
+                self.initializeYoloKalmanFilters()
 
         return False
     
     
-    # actual main loop
+    # actual main loopq
     def runTheLoop(self):
         # when was the last frame
         self.last_frame_time = time.time()
@@ -861,6 +1147,7 @@ class BallDropTracker:
                 self.prev_frame = None
                 # also reset teh filters
                 self.initializeKalmanFilters()
+                self.initializeYoloKalmanFilters()
                 continue
 
             # Get the TRUE current frame number from OpenCV
@@ -873,10 +1160,11 @@ class BallDropTracker:
                 if self.collectingPlotData and not collecting_just_finished:
                     print(f"Cropped segment completed (reached frame {current_frame})... saving plot!")
                     self.plot_combined_data()
+                    self.plot_YOLOcombined_data()
                     self.collectingPlotData = False
                     collecting_just_finished = True
 
-                # 2. ALWAYS loop back to the start of the crop (this is the new behavior you want)
+                # 2. ALWAYS loop back to the start of the crop if it has been cropped
                 start_frame = self.crop_start_frame if self.crop_start_frame is not None else 0
                 print(f"Looping cropped segment ... resetting to frame {start_frame}")
                 self.vidCapture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -887,7 +1175,8 @@ class BallDropTracker:
                 self.prev_centroid = None
                 self.pixVelocity = (0.0, 0.0)
                 self.range_rate = 0.0
-                self.initializeKalmanFilters()
+                self.initializeKalmanFilters() # rest the darned filters
+                self.initializeYoloKalmanFilters()
 
                 time.sleep(0.01)   # give OpenCV time to seek reliably if its being a pos
                 continue

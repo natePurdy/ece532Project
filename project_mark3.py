@@ -19,18 +19,18 @@ class BallDropTracker:
         self.original_fps = self.vidCapture.get(cv2.CAP_PROP_FPS)
         self.width = int(self.vidCapture.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.vidCapture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
+        self.create_legend_window()
         # Processing parameters
-        self.canny_low = 30
+        self.canny_low = 30 # edge detector
         self.canny_high = 120
-        self.blur_kernel_size = 3
+        self.blur_kernel_size = 3  # blurring / image smoothing
         self.blur_sigma = 2.0
-        self.motion_thresh = 25
-        self.min_contour_area = 100
-        self.morph_kernel_size = 7
-        self.morph_iterations_close = 3
-        self.morph_iterations_open = 2
-        self.use_convex_fill = False
+        self.motion_thresh = 10     # base threshold used for frame diffing - motion detection
+        self.min_contour_area = 100    # contour finding 
+        self.morph_kernel_size = 7    # hole filling
+        self.morph_iterations_close = 3    # hole filling
+        self.morph_iterations_open = 2      # hole filling
+        self.use_convex_fill = False     # might be a good backup when the shape is not round
 
         # 4-sided ROI - starting from zero (full image by default)
         self.roi_left = 0
@@ -38,39 +38,19 @@ class BallDropTracker:
         self.roi_top = 0
         self.roi_bottom = 0
         # Dynamic tracking box around the ball (to reduce background motion noise)
-        self.tracking_box_base_size = 600      # smallest box when very confident
-        self.tracking_box_max_size = 800       # largest box when uncertain
+        self.tracking_box_base_size = 200      # smallest box when very confident
+        self.tracking_box_max_size = 1000       # largest box when uncertain
         self.tracking_box = None
+        self.current_tracking_box_size = self.tracking_box_max_size # start 
 
         self.min_pixVelocity_threshold = 0
 
+        # edge detctor
         self.use_opencv_canny = True
         self.motion_mode = "frame_diff"
 
         #  ----------------------- Kalman filter setup  -----------------------
-        self.kalman_pixel = cv2.KalmanFilter(4, 2)
-        self.kalman_pixel.measurementMatrix = np.array([[1, 0, 0, 0], 
-                                                  [0, 1, 0, 0]], np.float32)
-        self.kalman_pixel.transitionMatrix = np.array([[1, 0, 1, 0],
-                                                 [0, 1, 0, 1],
-                                                 [0, 0, 1, 0],
-                                                 [0, 0, 0, 1]], np.float32)
-        self.kalman_pixel.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        self.kalman_pixel.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
-        self.kalman_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
-
-        # Range mode Kalman (Z, vZ) - simpler 2-state filter
-        self.kalman_range = cv2.KalmanFilter(2, 1)
-        self.kalman_range.measurementMatrix = np.array([[1, 0]], np.float32)          # measure only position
-        self.kalman_range.transitionMatrix = np.array([[1, 1/self.original_fps],      # dt = 1/FPS
-                                                       [0, 1]], np.float32)
-        self.kalman_range.processNoiseCov = np.array([[0.01, 0.0],
-                                                      [0.0,  1.0]], dtype=np.float32)        # tune as needed
-        self.kalman_range.measurementNoiseCov = np.array([[1.0]], np.float32)         # range measurement noise
-        self.kalman_range.errorCovPost = np.eye(2, dtype=np.float32) * 1.0
-
-        self.use_kalman = True
-        self.kalman_initialized = False
+        self.initializeKalmanFilters()
 
 
         #  ----------------------- mONOCULAR RANGE ESTIMATION SETUP  -----------------------
@@ -80,8 +60,8 @@ class BallDropTracker:
         self.prev_Z_raw: Optional[float] = None
         self.prev_range: Optional[float] = None # 
         self.prev_diam: Optional[float] = None
-        self.vx_mps: float = 0.0
-        self.vy_mps: float = 0.0
+        self.vx_mps: float = 0.0 # velocity in meters per second, x direction
+        self.vy_mps: float = 0.0 # velocity in meters per second, y direction
         self.range_rate: float = 0.0   
         # monocular x and Y velocity stuff based on range
         # ----------------------        Playback control         -----------------------
@@ -97,6 +77,7 @@ class BallDropTracker:
         self.prev_centroid: Optional[Tuple[int, int]] = None
         self.pixVelocity = (0.0, 0.0)
 
+
         # Crop control for data collection
         self.crop_start_frame: Optional[int] = None
         self.crop_end_frame: Optional[int] = None
@@ -106,12 +87,12 @@ class BallDropTracker:
         self.pixVelocity_history: List[Tuple[float, float]] = [] # x and y pixel velocity
         self.range_history: List[float] = []          # Z (meters)
         self.range_rate_history: List[float] = []     # vr (m/s)
-        self.frame_times: List[float] = []
-        self.vx_mps_history: List[float] = []
-        self.vy_mps_history: List[float] = []
+        self.frame_times: List[float] = []  # times for frame capture
+        self.vx_mps_history: List[float] = []   # vx m/s
+        self.vy_mps_history: List[float] = []    # vy m/s
 
         # Window setup
-        self.window_name =f"Ball Tracker"
+        self.window_name =f"Ball Tracker mk3"
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 1800, 700)
 
@@ -154,36 +135,144 @@ class BallDropTracker:
         print("  , / . : Min Velocity Threshold ±500 px/s")
         print("=================")
 
+    # the legend was starting to take up too much of the video window
+    def create_legend_window(self):
+        """Create a separate window with a clean legend explaining all colors/shapes"""
+        legend_height = 380
+        legend_width = 620
+        self.legend_img = np.zeros((legend_height, legend_width, 3), dtype=np.uint8)
+        
+        # Background
+        self.legend_img[:] = (40, 40, 50)  # dark gray-blue
+
+        def put_text(text, y, color=(200, 200, 255), scale=0.75, thickness=2):
+            cv2.putText(self.legend_img, text, (20, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+
+        put_text("BALL TRACKER - COLOR LEGEND", 40, (0, 255, 255), 1.0, 3)
+
+        # Cyan box - Motion tracking
+        cv2.rectangle(self.legend_img, (40, 80), (120, 110), (0, 255, 255), 3)
+        put_text("Yellow Box  →  Motion Tracking Area", 100, (0, 255, 255))
+
+        # Yellow box - Segmentation ROI
+        cv2.rectangle(self.legend_img, (40, 130), (120, 160), (0, 255, 0), 3)
+        put_text("Green Box → Segmentation ROI (clean diameter)", 150, (0, 255, 0))
+
+        # Green circle - Tracked centroid
+        cv2.circle(self.legend_img, (80, 200), 12, (0, 255, 0), -1)
+        put_text("Green Circle → Tracked Ball Centroid", 205, (0, 255, 0))
+
+        # Magenta circle - Clean ball outline
+        cv2.circle(self.legend_img, (80, 250), 12, (255, 0, 255), 3)
+        put_text("Magenta Circle → Clean ball used for Range estimation", 255, (255, 0, 255))
+
+        # Red arrow - Real-world velocity
+        cv2.arrowedLine(self.legend_img, (50, 290), (130, 290), (0, 0, 255), 4, tipLength=0.4)
+        put_text("Red Arrow → Real-world velocity (Vx, Vy)", 295, (0, 0, 255))
+
+        # Yellow trajectory
+        cv2.polylines(self.legend_img, [np.array([[180, 330], [220, 320], [260, 335], [300, 325]])], 
+                     False, (255, 255, 0), 3)
+        put_text("Yellow Line → Ball trajectory", 335, (255, 255, 0))
+
+        # Final note
+        put_text("Motion box (cyan) is used for detection.", 370, (180, 180, 180), 0.6)
+        put_text("Yellow box is used for clean color-based range estimation.", 395, (180, 180, 180), 0.6)
+
+        cv2.namedWindow("Legend", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Legend", legend_width, legend_height)
+        cv2.imshow("Legend", self.legend_img)
+
+
     # kalman filter needs to be reset every video loop (and probably other times too...)
-    def resetKalmanPixel(self):
-        self.kalman_pixel.statePost = np.zeros((4, 1), np.float32)
-        self.kalman_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 1.0
+    # dirty reset, just copy the init section
+    def initializeKalmanFilters(self):
+        # kalman pixel velocities (4 states, position x and y, and velcocity x and y)
+        self.kalman_pixel = cv2.KalmanFilter(4, 2)
+        self.kalman_pixel.measurementMatrix = np.array([[1, 0, 0, 0], 
+                                                  [0, 1, 0, 0]], np.float32)
+        self.kalman_pixel.transitionMatrix = np.array([[1, 0, 1, 0],
+                                                 [0, 1, 0, 1],
+                                                 [0, 0, 1, 0],
+                                                 [0, 0, 0, 1]], np.float32)
+        self.kalman_pixel.processNoiseCov = np.eye(4, dtype=np.float32) * 0.5
+        self.kalman_pixel.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1
+        self.kalman_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 50
 
-    def resetKalmanRange(self):
-        self.kalman_range.statePost = np.zeros((2, 1), np.float32)
-        self.kalman_range.errorCovPost = np.eye(2, dtype=np.float32) * 1.0
-        self.range = 2.0
-        self.range_rate = 0.0
-
-    def resetKalman(self):
-        """Reset the appropriate Kalman filter based on current mode"""
-        self.kalman_initialized = False
-        self.prev_centroid = None
-        self.prev_Z_raw = None
-        self.trajectory.clear()
-        self.resetKalmanPixel()
-        self.resetKalmanRange()
+        # Range mode Kalman (Z, vZ) - simpler 2-state filter
+        self.kalman_range = cv2.KalmanFilter(2, 1)
+        self.kalman_range.measurementMatrix = np.array([[1, 0]], np.float32)          # measure only position
+        self.kalman_range.transitionMatrix = np.array([[1, 1/self.original_fps],      # dt = 1/FPS
+                                                       [0, 1]], np.float32)
+        self.kalman_range.processNoiseCov = np.array([[0.1, 0.0],
+                                                      [0.0,  1.0]], dtype=np.float32) *1      # good range estimate is assumed in order to not have 
+        self.kalman_range.measurementNoiseCov = np.array([[1.0]], np.float32) *1        # range measurement noise
+        self.kalman_range.errorCovPost = np.eye(2, dtype=np.float32) * 50
+        self.use_kalman = True
+        self.kalman_initialized = True
 
 
+    # try using the tracking box to help clean up the segmantation of the object
+    def segment_ball_in_roi(self, original: np.ndarray, cx: int, cy: int) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+        """Crop a box around the tracked centroid and do clean color-based segmentation.
+        Returns (pixel_diam, center_x, center_y) or (None, None, None) if segmentation fails."""
 
+        box_size = 250
+        half = box_size // 2
+        
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(self.width, cx + half)
+        y2 = min(self.height, cy + half)
+
+        # Draw the segmentation ROI (light green) - will be very noisy in its placement since its based on center of weight of moving objects contours
+        cv2.rectangle(original, (x1, y1), (x2, y2), (0, 255, 100), 2)
+
+        roi = original[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None, None, None
+
+        # HSV color segmentation for tennis ball
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lower_yellow = np.array([20, 80, 80])
+        upper_yellow = np.array([45, 255, 255])
+        
+        mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+
+        # Clean up mask
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, None, None
+
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < 50:
+            return None, None, None
+
+        # Get accurate center and radius using minEnclosingCircle
+        (x, y), radius = cv2.minEnclosingCircle(largest)
+        pixel_diam = 2 * radius
+
+        # Convert center from ROI coordinates back to original image coordinates
+        center_x = int(x1 + x)
+        center_y = int(y1 + y)
+
+        # draw the segmented circle - should be very stable
+        cv2.circle(original, (center_x, center_y), int(radius), (255, 0, 255), 2)
+
+        return pixel_diam, center_x, center_y
 
 
     # process a single frame of video (frame by frame logic here)
     def processNextFrame(self, frame: np.ndarray, current_frame_num: int) -> Tuple[np.ndarray, np.ndarray]:
         original = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # blurred = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), self.blur_sigma)
-        blurred=gray
+        blurred = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), self.blur_sigma)
+        # blurred=gray # dont actually blur the thing
         if self.motion_mode == "canny":
             if self.use_opencv_canny:
                 processed = cv2.Canny(blurred, self.canny_low, self.canny_high)
@@ -208,9 +297,9 @@ class BallDropTracker:
 
             # --- perform some morphology to clean up the blob/object
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
-            # Close → fills small gaps inside the ball
+            # Close allegedly fills small gaps inside the ball
             processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel, iterations=3)
-            # Open → removes small noise around the ball
+            # Open allegedly removes small noise around the ball
             processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel, iterations=3)
 
             # Update previous frame
@@ -223,7 +312,7 @@ class BallDropTracker:
         if self.roi_top > 0:    processed[:self.roi_top, :] = 0
         if self.roi_bottom > 0: processed[-self.roi_bottom:, :] = 0
 
-        self.detectAndTrack(processed, original)
+        self.detectAndTrack(processed, original) # apply detect and tracking algrothm to frames
 
         # Data collection
         if self.collectingPlotData:                   
@@ -238,70 +327,72 @@ class BallDropTracker:
                 self.range_rate_history.append(self.range_rate)
                 self.pixVelocity_history.append(self.pixVelocity)
             else:
-                # Ball was lost this frame,  repeat the last good values (much better than stale or zero)
-                if self.vx_mps_history:
-                    self.vx_mps_history.append(self.vx_mps_history[-1])
-                    self.vy_mps_history.append(self.vy_mps_history[-1])
-                    self.range_history.append(self.range_history[-1])
-                    self.range_rate_history.append(self.range_rate_history[-1])
-                    self.pixVelocity_history.append(self.pixVelocity_history[-1])
-                else:
-                    # First frame ever — just put zeros
-                    self.vx_mps_history.append(0.0)
-                    self.vy_mps_history.append(0.0)
-                    self.range_history.append(self.range)
-                    self.range_rate_history.append(0.0)
-                    self.pixVelocity_history.append((0.0, 0.0))
+
+                # ball lost
+                self.vx_mps_history.append(0.0)
+                self.vy_mps_history.append(0.0)
+                self.range_history.append(0.0)
+                self.range_rate_history.append(0.0)
+                self.pixVelocity_history.append((0.0, 0.0))
 
         processed_color = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
         return original, processed_color
 
+    # this is a hefty one...
     # perform detection of moving objects, and tracking
-    # ====================== COMBINED MODE - Both Pixel + Range ======================
+    #  Two-stage: motion mask ONLY for position tracking, original image + clean segmentation for range
     def detectAndTrack(self, motion_mask: np.ndarray, original: np.ndarray):
-        # ------------------- Search Region Setup -------------------
-        if self.prev_centroid is None:
+
+        # ------------------- ------------------------------------------Search Region Setup (motion mask) -------------------
+        if self.prev_centroid is None: 
+            # was there not a centroid detected from motion mask of previous frame? TODO: check if i actually need this if statement
             search_mask = motion_mask.copy()
+            self.current_tracking_box_size = self.tracking_box_max_size
         else:
             prev_x, prev_y = self.prev_centroid
             if self.use_kalman and self.kalman_initialized:
-                
                 cov1 = self.kalman_pixel.errorCovPost
                 uncertainty1 = np.sqrt(cov1[0,0] + cov1[1,1])
-                # cov2 = self.kalman_range.errorCovPost
-                # uncertainty2 = np.sqrt(cov2[0,0])
-                box_size = int(self.tracking_box_base_size + uncertainty1 * 5) # probably use the x and y velocity to determine trakcing box size, since sdizeways velocity will be more determinental if whiplashed
-                box_size = max(self.tracking_box_base_size, min(self.tracking_box_max_size, box_size))
-            else:
-                box_size = self.tracking_box_max_size
 
-            half = box_size // 2
+                cov2 = self.kalman_range.errorCovPost
+                uncertainty2 = np.sqrt(cov2[0,0] + cov2[1,1])
+                # print(uncertainty2)
+                # make the "focusing box" for tracking shrink as a function of object velocicyt and filter confidence
+                self.current_tracking_box_size = int(self.tracking_box_base_size + uncertainty2**3 * np.ceil(np.sqrt(self.vx_mps**2 + self.vy_mps**2))) # simply homecooked function of uncertainty and xy velocity
+                self.current_tracking_box_size = max(self.tracking_box_base_size, min(self.tracking_box_max_size, self.current_tracking_box_size))
+            else:
+
+                # if the kalman is not being used, keep the tracking box the maximum size ~ half the viewing display
+                self.current_tracking_box_size = self.tracking_box_max_size
+                
+            # print(f"Current Box Size: {self.current_tracking_box_size}")
+            half = self.current_tracking_box_size // 2
             x = max(0, prev_x - half)
             y = max(0, prev_y - half)
-            w = min(self.width - x, box_size)
-            h = min(self.height - y, box_size)
+            w = min(self.width - x, self.current_tracking_box_size)
+            h = min(self.height - y, self.current_tracking_box_size)
             self.tracking_box = (x, y, w, h)
 
             search_mask = np.zeros_like(motion_mask)
             search_mask[y:y+h, x:x+w] = motion_mask[y:y+h, x:x+w]
 
-        # ------------------- Contour Detection -------------------
+        # ------------------- Contour Detection on motion mask (position only) -------------------
         contours, _ = cv2.findContours(search_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # no contours and no motion, reset the filter
         if not contours:
+            # self.initializeKalmanFilters()
             return
 
-        # Debug: all contours in yellow
         cv2.drawContours(original, contours, -1, (0, 255, 255), 1)
 
-        # Filter + valid contours
         min_area_threshold = 0.1 * cv2.contourArea(max(contours, key=cv2.contourArea))
         valid_contours = [c for c in contours if cv2.contourArea(c) >= min_area_threshold]
         if not valid_contours:
             valid_contours = [max(contours, key=cv2.contourArea)]
 
-        cv2.drawContours(original, valid_contours, -1, (255, 255, 0), 2)
+        # cv2.drawContours(original, valid_contours, -1, (255, 255, 0), 2)
 
-        # Weighted centroid
+        # Weighted centroid (used for tracking & pixel velocity)
         total_area = 0.0
         weighted_cx = weighted_cy = 0.0
         for c in valid_contours:
@@ -318,14 +409,21 @@ class BallDropTracker:
         cx = int(weighted_cx / total_area)
         cy = int(weighted_cy / total_area)
 
-        # Largest contour for diameter estimation
-        largest = max(contours, key=cv2.contourArea)
-        cv2.drawContours(original, [largest], -1, (0, 255, 0), 2)
+        # this is kinda wonky right here but im using the tracking box of the objects contours to create smaller and easier section of image to find clean contours (the object ball) on
+        # this is extrememly helpful when the object is roling or has dots on it and the contours of the object are changing and growing/shrinking and have nosiy center of mass
+        # i dont even think the almighty kalman can make up for the noisy contour center of mass tracking paradigm i have going currently...
+        pixel_diam = None
+        if self.prev_centroid is not None:   # only attempt after we have a valid track
+            # now get a better centroid using all centroids center of mass of grayscale image to get a cleaner segmentation for x and y velocities
+            temp_diam, temp_cx, temp_cy = self.segment_ball_in_roi(original, cx, cy)
+            if temp_diam is not None:      # segmentation found,                    
+                pixel_diam = temp_diam
+                cx = temp_cx
+                cy = temp_cy
 
-        # ====================== PIXEL VELOCITY (always computed) ======================
+        # ---------------------------------------------------------------------- Pixel velocity stuff
         if self.use_kalman:
             measurement = np.array([[np.float32(cx)], [np.float32(cy)]], np.float32)
-
             if not self.kalman_initialized:
                 self.kalman_pixel.statePost = np.array([[cx], [cy], [0.0], [0.0]], np.float32)
                 self.kalman_initialized = True
@@ -333,30 +431,33 @@ class BallDropTracker:
             else:
                 self.kalman_pixel.predict()
                 self.kalman_pixel.correct(measurement)
-                vx_px = self.kalman_pixel.statePost[2][0] * self.original_fps
-                vy_px = self.kalman_pixel.statePost[3][0] * self.original_fps
-
+                vx_px = self.kalman_pixel.statePost[2][0] * self.original_fps # x velocity in pixels/s
+                vy_px = self.kalman_pixel.statePost[3][0] * self.original_fps # y velocity in pixels/s
             self.pixVelocity = (vx_px, vy_px)
             draw_x = int(self.kalman_pixel.statePost[0][0])
             draw_y = int(self.kalman_pixel.statePost[1][0])
         else:
+            # not using the kalman filter (turned off pressing 'f')
             if self.prev_centroid is not None:
-                dx = cx - self.prev_centroid[0]
+                dx = cx - self.prev_centroid[0] 
                 dy = cy - self.prev_centroid[1]
-                self.pixVelocity = (dx * self.original_fps, dy * self.original_fps)
+                self.pixVelocity = (dx * self.original_fps, dy * self.original_fps) # (x, y) velocity in pixels/s
             else:
                 self.pixVelocity = (0.0, 0.0)
             draw_x, draw_y = cx, cy
 
-        # ====================== RANGE ESTIMATION (always computed) ======================
-        (xc, yc), radius = cv2.minEnclosingCircle(largest)
-        pixel_diam = 2 * radius
-        Z_raw = (self.focal_length_px * self.ball_real_diam_m) / pixel_diam if pixel_diam > 5 else self.range
+        # range estimateion using the previously calculated object diameter
+        if pixel_diam is None or pixel_diam < 5:
+            # fallback to previous range if segmentation fails
+            Z_raw = self.range
+        else:
+            # approximate teh range using the follwoing eqn
+            Z_raw = (self.focal_length_px * self.ball_real_diam_m) / pixel_diam
 
+        # Range Kalman filter
         if self.use_kalman:
             measurement = np.array([[np.float32(Z_raw)]], np.float32)
-
-            if not self.kalman_initialized:   # Note: we reuse the flag for simplicity
+            if not self.kalman_initialized:
                 self.kalman_range.statePost = np.array([[Z_raw], [0.0]], np.float32)
                 self.kalman_initialized = True
                 self.range = Z_raw
@@ -375,39 +476,33 @@ class BallDropTracker:
             self.range = Z_raw
             self.prev_Z_raw = Z_raw
 
-        #  REAL-WORLD approx VELOCITIES (Vx, Vy in m/s) 
-        Z = max(self.range, 0.1)  # prevent division by zero
+        # Real-world velocities (using the pixel velocities and raneg estimate)
+        Z = max(self.range, 0.1)
         self.vx_mps = (self.pixVelocity[0] * Z) / self.focal_length_px
         self.vy_mps = (self.pixVelocity[1] * Z) / self.focal_length_px
-
-        # ====================== DISPLAY LABEL (Everything combined) ======================
-        label = (f"Range: {self.range:.2f}m   delta-range: {self.range_rate:+.2f} m/s\n"
-                 f"Vel: {self.pixVelocity[0]:.0f}, {self.pixVelocity[1]:.0f} px/s\n"
-                 f"Vx: {self.vx_mps:+.2f} m/s    Vy: {self.vy_mps:+.2f} m/s")
 
         # ====================== DRAWING ======================
         self.trajectory.append((draw_x, draw_y))
         self.prev_centroid = (draw_x, draw_y)
 
+        # Main tracking point (tiny centroid of the center of mass of the objects contours)
         cv2.circle(original, (draw_x, draw_y), 12, (0, 255, 0), -1)
 
-        # Arrow using real-world velocity (better visual scaling)
-        arrow_scale = 12.0
-        cv2.arrowedLine(original,
-                        (draw_x, draw_y),
-                        (int(draw_x + self.vx_mps * arrow_scale),
-                         int(draw_y + self.vy_mps * arrow_scale)),
-                        (0, 0, 255), 3, tipLength=0.5)
-
+        # Motion tracking box - green
         if self.tracking_box:
             bx, by, bw, bh = self.tracking_box
-            cv2.rectangle(original, (bx, by), (bx + bw, by + bh), (255, 165, 0), 2)
+            cv2.rectangle(original, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)   # Cyan
 
+        # Trajectory path
         if len(self.trajectory) > 1:
             pts = np.array(self.trajectory, dtype=np.int32)
             cv2.polylines(original, [pts], False, (255, 255, 0), 3)
 
-        # Multi-line text (OpenCV doesn't support \n directly, so we draw line by line)
+        # add labels and a legend to the cv display
+        label = (f"Range: {self.range:.2f}m   vr: {self.range_rate:+.2f} m/s\n"
+                 f"Vel: {self.pixVelocity[0]:.0f}, {self.pixVelocity[1]:.0f} px/s\n"
+                 f"Vx: {self.vx_mps:+.2f} m/s    Vy: {self.vy_mps:+.2f} m/s")
+
         y_offset = 50
         for i, line in enumerate(label.split('\n')):
             cv2.putText(original, line, (20, y_offset + i*35),
@@ -419,12 +514,15 @@ class BallDropTracker:
         status = "Kalman ON" if self.use_kalman else "Kalman OFF (raw)"
         cv2.putText(original, status, (20, y_offset + 145),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 255, 100), 2)
+
+       
+
     
     # plot the pixVelocity for a single loop of video
     def plot_combined_data(self):
         """Plot all data in one figure:
-        - Top: Vx and Vy (m/s) on same axes
-        - Bottom: Range (m) and Range-rate (m/s) on same axes
+        - Top: Vx and Vy (m/s) limited to ±10 m/s
+        - Bottom: Range (m) and Range-rate (m/s)
         """
         if len(self.frame_times) < 5:
             print("Not enough valid data collected (need at least 5 points).")
@@ -437,13 +535,11 @@ class BallDropTracker:
             t = [ti - t0 for ti in t]
 
         # Prepare real-world velocities (m/s)
-        # If we have vx_mps / vy_mps history from combined mode, use it.
-        # Otherwise fall back (for older collections)
         if hasattr(self, 'vx_mps_history') and len(self.vx_mps_history) > 0:
             vx = self.vx_mps_history
             vy = self.vy_mps_history
         else:
-            # Fallback: convert pixel velocity using average range if available
+            # Fallback
             vx = []
             vy = []
             avg_range = np.mean(self.range_history) if self.range_history else 2.0
@@ -455,28 +551,30 @@ class BallDropTracker:
 
         fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
 
-        # ====================== TOP PLOT: Vx and Vy (m/s) ======================
+        # ====================== TOP PLOT: Vx and Vy (m/s) with Y-limit ±10 ======================
         axs[0].scatter(t, vy, c='blue', s=40, alpha=0.8, label='Vy (vertical)')
         axs[0].plot(t, vy, 'b-', linewidth=1.8, alpha=0.7)
 
         axs[0].scatter(t, vx, c='red', s=40, alpha=0.8, label='Vx (horizontal)')
         axs[0].plot(t, vx, 'r-', linewidth=1.8, alpha=0.7)
 
-        axs[0].set_title('Horizontal and Vertical Velocities', fontsize=14, fontweight='bold')
+        axs[0].set_title('Horizontal and Vertical Velocities (limited to ±10 m/s)', 
+                        fontsize=14, fontweight='bold')
         axs[0].set_ylabel('Velocity (m/s)', fontsize=12)
         axs[0].grid(True, alpha=0.3)
         axs[0].legend(fontsize=11)
         axs[0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 
+        # LIMIT Y-AXIS TO ±5 m/s which is about +- 10 miles per hour ( i dont expect fast objects at this point)
+        axs[0].set_ylim(-5, 5)
+
         # ====================== BOTTOM PLOT: Range and Range-rate ======================
-        # Range (left y-axis)
         ax1 = axs[1]
         ax1.scatter(t, self.range_history, c='green', s=40, alpha=0.8, label='Range Z (m)')
         ax1.plot(t, self.range_history, 'g-', linewidth=1.8, alpha=0.7)
         ax1.set_ylabel('Range (meters)', color='green', fontsize=12)
         ax1.tick_params(axis='y', labelcolor='green')
 
-        # Range-rate (right y-axis)
         ax2 = ax1.twinx()
         ax2.scatter(t, self.range_rate_history, c='purple', s=40, alpha=0.8, label='Range-rate vr (m/s)')
         ax2.plot(t, self.range_rate_history, 'purple', linewidth=1.8, alpha=0.7)
@@ -487,7 +585,7 @@ class BallDropTracker:
         ax1.set_xlabel('Time (seconds)', fontsize=12)
         ax1.grid(True, alpha=0.3)
 
-        # Combine legends from both y-axes
+        # Combine legends
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=11, loc='upper right')
@@ -501,6 +599,7 @@ class BallDropTracker:
 
         print(f"Combined plot saved as: {plot_filename}")
         print("You can open the PNG file to view Vx/Vy + Range/vr together.\n")
+    
     # this is horrible dont look inside
     def handleKeyboard(self, key: int) -> bool:
         if key == ord('q'):
@@ -539,7 +638,9 @@ class BallDropTracker:
             self.trajectory.clear()
             self.prev_centroid = None
             self.pixVelocity = (0.0, 0.0)
-            self.resetKalman()
+            if self.use_kalman:
+                self.initializeKalmanFilters() # dont turn on the filters if saving an unfiltered plot...
+            
 
             print(f"→ Starting NEW cropped collection from frame {self.crop_start_frame} "
                   f"to {self.crop_end_frame}. Press 'd' again only after it finishes.")
@@ -560,7 +661,7 @@ class BallDropTracker:
             self.trajectory.clear()
             self.prev_centroid = None
             self.pixVelocity = (0.0, 0.0)
-            self.resetKalman()
+            self.initializeKalmanFilters()
             print(f"Mode → {self.motion_mode.upper()}")
 
         elif key == ord('w'):  # Reset all ROI to zero
@@ -630,10 +731,10 @@ class BallDropTracker:
             self.blur_sigma = min(10.0, self.blur_sigma + 0.5)
             print(f"Blur Sigma: {self.blur_sigma:.1f}")
         elif key == ord('9'):
-            self.motion_thresh = max(5, self.motion_thresh - 5)
+            self.motion_thresh = max(1, self.motion_thresh - 1)
             print(f"Motion Threshold: {self.motion_thresh}")
         elif key == ord('0'):
-            self.motion_thresh = min(100, self.motion_thresh + 5)
+            self.motion_thresh = min(100, self.motion_thresh + 1)
             print(f"Motion Threshold: {self.motion_thresh}")
         elif key == ord('['):
             self.min_contour_area = max(50, self.min_contour_area - 50)
@@ -651,7 +752,7 @@ class BallDropTracker:
             print(f"Morph Kernel Size: {self.morph_kernel_size}")
         # elif key == ord('b'):
         #     self.tracking_mode = 1 - self.tracking_mode
-        #     self.resetKalman()                     # now mode-aware
+        #     self.initializeKalmanFilters()                     # now mode-aware
         #     print(f"Tracking Mode: {self.mode_names[self.tracking_mode]}")
         #     self.window_name = f"Ball Tracker - {self.mode_names[self.tracking_mode]} Mode"
         #     cv2.setWindowTitle(self.window_name, self.window_name)
@@ -683,12 +784,14 @@ class BallDropTracker:
                 start_frame = self.crop_start_frame if self.crop_start_frame is not None else 0
                 self.vidCapture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
                 self.prev_frame = None
+                # also reset teh filters
+                self.initializeKalmanFilters()
                 continue
 
             # Get the TRUE current frame number from OpenCV
             current_frame = int(self.vidCapture.get(cv2.CAP_PROP_POS_FRAMES))
 
-            # ====================== CROP LOOPING LOGIC ======================
+            # Allows the user to crop the interesting part of the video, and only plot that as well
             if self.crop_end_frame is not None and current_frame >= self.crop_end_frame:
 
                 # 1. if data was being collected, save the plot save the plot
@@ -709,7 +812,7 @@ class BallDropTracker:
                 self.prev_centroid = None
                 self.pixVelocity = (0.0, 0.0)
                 self.range_rate = 0.0
-                self.resetKalman()
+                self.initializeKalmanFilters()
 
                 time.sleep(0.01)   # give OpenCV time to seek reliably if its being a pos
                 continue
@@ -721,6 +824,7 @@ class BallDropTracker:
             # regular video processing that needs to be done every frame in order to display whats happening
             original_annotated, motion_color = self.processNextFrame(frame, current_frame)
 
+            # add the drawings to the original image to show whats happening in the algorithms kind of
             combined = np.hstack((original_annotated, motion_color))
             target_width = 1800
             scale = target_width / combined.shape[1]
@@ -740,12 +844,16 @@ class BallDropTracker:
             if self.handleKeyboard(key):
                 break
 
-        # Cleanup
+        # Cleanup stuff
         self.vidCapture.release()
         cv2.destroyAllWindows()
         plt.close('all')
 
+        
+
 if __name__ == "__main__":
-    # tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260402_111440.mp4")
-    tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260402_111032.mp4")
+    # tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260402_111032.mp4")
+    tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260407_075000.mp4")
+    # tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260407_073730.mp4")
+    
     tracker.runTheLoop()

@@ -80,6 +80,11 @@ class BallDropTracker:
         self.yolo_pixVelocity = (0.0, 0.0)
         self.yolo_vx_mps: float = 0.0
         self.yolo_vy_mps: float = 0.0
+        # decide what classes to filter depending on what you are looking to range (decrease spurrious classicications)
+        self.allowed_yolo_classes = {
+            "sports ball", "orange", "apple", "tennis ball", 
+            "baseball", "soccer ball", "frisbee"
+        }
            
         # ----------------------        Playback control         -----------------------
         self.display_fps = 15.0
@@ -154,7 +159,7 @@ class BallDropTracker:
     #function to print out the user controls 
     def printInstructions(self):
         print(f"Video loaded: {self.width}x{self.height} @ {self.original_fps:.2f} FPS")
-        print("\n=== Controls ===")
+        print("\n~~~~~ Controls ~~~~~")
         print("  + / -     : Display FPS ±5")
         print("  p         : Pause / Resume")
         print("  r         : Reset to original speed")
@@ -166,7 +171,7 @@ class BallDropTracker:
         print("  b         : Toggle Tracking Mode (Pixel <-> Range)")
         print("  w         : Reset all ROI to zero (undo cropping)")
         print("  q         : Quit")
-        print("\n=== ROI Tuning (Arrow Keys) ===")
+        print("\n~~~~~ ROI Tuning (Arrow Keys) ~~~~~")
         print("  ←         : Increase left crop")
         print("  →         : Increase right crop")
         print("  ↑         : Increase top crop")
@@ -182,13 +187,13 @@ class BallDropTracker:
         print("  ; / ' : Morphology Kernel Size ±2")
         print("  j / k : ROI Left Crop ±20 (backup)")
         print("  , / . : Min Velocity Threshold ±500 px/s")
-        print("=================")
+        print("~~~~~~~~~~~~~~~~~~~~~~~~")
 
     # the legend was starting to take up too much of the video window
     def create_legend_window(self):
-        """Create a separate window with a clean legend explaining all colors/shapes"""
-        legend_height = 380
-        legend_width = 620
+        """Updated legend window that matches the current cv2 display visuals"""
+        legend_height = 660
+        legend_width = 780
         self.legend_img = np.zeros((legend_height, legend_width, 3), dtype=np.uint8)
         
         # Background
@@ -198,41 +203,48 @@ class BallDropTracker:
             cv2.putText(self.legend_img, text, (20, y), 
                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
-        put_text("BALL TRACKER - COLOR LEGEND", 40, (0, 255, 255), 1.0, 3)
+        put_text("BALL TRACKER - CURRENT COLOR LEGEND", 40, (0, 0, 255), 1.0, 3)
 
-        # Cyan box - Motion tracking
-        cv2.rectangle(self.legend_img, (40, 80), (120, 110), (0, 255, 255), 3)
-        put_text("Yellow Box  →  Motion Tracking Area", 100, (0, 255, 255))
+        # === Panel 1: Classical Tracking ===
+        put_text("1. CLASSICAL TRACKING (Left Panel)", 80, (0, 255, 0), 0.9, 2)
 
-        # Yellow box - Segmentation ROI
-        cv2.rectangle(self.legend_img, (40, 130), (120, 160), (0, 255, 0), 3)
-        put_text("Green Box → Segmentation ROI (clean diameter)", 150, (0, 255, 0))
+        cv2.rectangle(self.legend_img, (40, 110), (120, 140), (0, 255, 255), 3)   # Cyan
+        put_text("          -->  Dynamic Motion Tracking Area", 130, (0, 255, 255))
 
-        # Green circle - Tracked centroid
-        cv2.circle(self.legend_img, (80, 200), 12, (0, 255, 0), -1)
-        put_text("Green Circle → Tracked Ball Centroid", 205, (0, 255, 0))
+        cv2.rectangle(self.legend_img, (40, 160), (120, 190), (0, 255, 100), 3)   # Light Green
+        put_text("          -->  HSV Segmentation ROI", 180, (0, 255, 100))
 
-        # Magenta circle - Clean ball outline
-        cv2.circle(self.legend_img, (80, 250), 12, (255, 0, 255), 3)
-        put_text("Magenta Circle → Clean ball used for Range estimation", 255, (255, 0, 255))
+        cv2.rectangle(self.legend_img, (40, 210), (120, 240), (0, 165, 255), 3)   # Orange
+        put_text("          -->  Bounding Box used for diameter", 230, (0, 165, 255))
 
-        # Red arrow - Real-world velocity
-        cv2.arrowedLine(self.legend_img, (50, 290), (130, 290), (0, 0, 255), 4, tipLength=0.4)
-        put_text("Red Arrow → Real-world velocity (Vx, Vy)", 295, (0, 0, 255))
+        cv2.circle(self.legend_img, (80, 270), 12, (0, 255, 0), -1)
+        put_text("          --> Final Tracked Centroid (Kalman)", 275, (0, 255, 0))
 
-        # Yellow trajectory
-        cv2.polylines(self.legend_img, [np.array([[180, 330], [220, 320], [260, 335], [300, 325]])], 
-                     False, (255, 255, 0), 3)
-        put_text("Yellow Line → Ball trajectory", 335, (255, 255, 0))
+        cv2.circle(self.legend_img, (80, 310), 6, (255, 0, 255), -1)
+        put_text("          --> Moments Center from HSV mask", 315, (255, 0, 255))
 
-        # Final note
-        put_text("Motion box (cyan) is used for detection.", 370, (180, 180, 180), 0.6)
-        put_text("Yellow box is used for clean color-based range estimation.", 395, (180, 180, 180), 0.6)
+        # === Panel 3: YOLO ===
+        put_text("3. YOLO SEGMENTATION (Right Panel)", 355, (0, 0, 255), 0.9, 2)
+
+        cv2.rectangle(self.legend_img, (40, 385), (120, 415), (0, 165, 255), 3)   # Orange
+        put_text("           --> YOLO Bounding Box (min side for diam)", 430, (0, 165, 255))
+
+        cv2.circle(self.legend_img, (80, 460), 12, (0, 255, 255), 3)              # Cyan circle
+        put_text("           --> Min Enclosing Circle on YOLO mask", 465, (0, 255, 255))
+
+        cv2.circle(self.legend_img, (80, 500), 6, (0, 255, 0), -1)
+        put_text("           --> Center used for YOLO tracking", 505, (0, 255, 0))
+
+
+        put_text(" ~~~~     --> Ball trajectory ", 585, (255, 255, 0))
+
+        # Final notes
+        put_text("Both sides now use min(w,h) of bounding box for diameter", 620, (180, 180, 180), 0.65)
+        put_text("(more fair comparison under motion blur)", 645, (180, 180, 180), 0.65)
 
         cv2.namedWindow("Legend", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Legend", legend_width, legend_height)
         cv2.imshow("Legend", self.legend_img)
-
     def load_specific_yolo_model(self, model_path: str):
         """Helper to switch between your locally saved models"""
         try:
@@ -255,7 +267,7 @@ class BallDropTracker:
                                                  [0, 0, 0, 1]], np.float32)
         self.kalman_pixel.processNoiseCov = np.eye(4, dtype=np.float32) * 1.0
         self.kalman_pixel.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
-        self.kalman_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 50
+        self.kalman_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 2
 
         # Range Kalman (Z, vZ)
         self.kalman_range = cv2.KalmanFilter(2, 1)
@@ -265,7 +277,7 @@ class BallDropTracker:
         self.kalman_range.processNoiseCov = np.array([[0.1, 0.0],
                                                       [0.0,  5]], dtype=np.float32) * 1
         self.kalman_range.measurementNoiseCov = np.array([[1.0]], np.float32) * 1
-        self.kalman_range.errorCovPost = np.eye(2, dtype=np.float32) * 50
+        self.kalman_range.errorCovPost = np.eye(2, dtype=np.float32) * 2
 
         self.use_kalman = True
         self.kalman_initialized = True
@@ -283,7 +295,7 @@ class BallDropTracker:
                                                     [0, 0, 0, 1]], np.float32)
         self.kalman_yolo_pixel.processNoiseCov = np.eye(4, dtype=np.float32) * 1.0
         self.kalman_yolo_pixel.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
-        self.kalman_yolo_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 50
+        self.kalman_yolo_pixel.errorCovPost = np.eye(4, dtype=np.float32) * 2
 
         # YOLO Range Kalman (Z, vZ)
         self.kalman_yolo_range = cv2.KalmanFilter(2, 1)
@@ -291,21 +303,34 @@ class BallDropTracker:
         self.kalman_yolo_range.transitionMatrix = np.array([[1, 1/self.original_fps],
                                                     [0, 1]], np.float32)
         self.kalman_yolo_range.processNoiseCov = np.array([[0.1, 0.0],
-                                                    [0.0,  5]], dtype=np.float32) * 1
+                                                           [0.0,  5]], dtype=np.float32) * 1
         self.kalman_yolo_range.measurementNoiseCov = np.array([[1.0]], np.float32) * 1
-        self.kalman_yolo_range.errorCovPost = np.eye(2, dtype=np.float32) * 50
+        self.kalman_yolo_range.errorCovPost = np.eye(2, dtype=np.float32) * 2
 
         self.use_yolo_kalman = True
         self.yolo_kalman_initialized = True
 
     def compute_yolo_range(self, result, current_frame_num: int, display_img: np.ndarray, roi_offset: Tuple[int, int] = (0, 0)):
-        """YOLO segmentation → min enclosing circle → Kalman-smoothed range + velocities.
-        Draws on the right YOLO panel."""
-        if not hasattr(result, 'masks') or result.masks is None or len(result.masks.data) == 0:
+        """YOLO segmentation → only process ball-like classes.
+        Uses MIN side of bounding box for diameter (more robust to motion blur)."""
+        
+        # ~~~~~ NEW: Quick class filter (very fast) ~~~~~
+        if len(result.boxes) == 0:
             return
+            
+        cls_id = int(result.boxes.cls[0])                    # top detection
+        cls_name = result.names[cls_id].lower()
+        
+        if cls_name not in [name.lower() for name in self.allowed_yolo_classes]:
+            return  # skip range/velocity estimation, but keep the visual overlay
 
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Proceed with allowed class ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         mask = result.masks.data[0].cpu().numpy()
         mask = (mask > 0.5).astype(np.uint8) * 255
+        # # Clean up mask
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -315,17 +340,22 @@ class BallDropTracker:
         if cv2.contourArea(largest) < 80:
             return
 
-        (cx, cy), radius = cv2.minEnclosingCircle(largest)
-        pixel_diam = 2 * radius
+        # Use MIN side of bounding box (better under motion blur)
+        x, y, w, h = cv2.boundingRect(largest)
+        pixel_diam = min(w, h)
 
+        # Center from circle (still good for tracking)
+        (cx, cy), _ = cv2.minEnclosingCircle(largest)
         ox, oy = roi_offset
-        center = (int(cx + ox), int(cy + oy))
-        r = int(radius)
+        center = (int(x + ox), int(y + oy))
 
-        cv2.circle(display_img, center, r, (0, 255, 255), 3)   # cyan circle
-        cv2.circle(display_img, center, 6, (0, 255, 0), -1)    # green dot
+        # Draw bounding box + circle
+        cv2.rectangle(display_img, 
+                     (int(x + ox), int(y + oy)), 
+                     (int(x + w + ox), int(y + h + oy)), 
+                     (0, 165, 255), 2)                    # orange box
 
-        # ====================== RANGE (Kalman smoothed) ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RANGE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if pixel_diam > 8:
             Z_raw = (self.focal_length_px * self.ball_real_diam_m) / pixel_diam
         else:
@@ -337,15 +367,13 @@ class BallDropTracker:
                 self.initializeYoloKalmanFilters()
                 self.kalman_yolo_range.statePost = np.array([[Z_raw], [0.0]], np.float32)
                 self.yolo_kalman_initialized = True
-                self.yolo_range = Z_raw
-                self.yolo_range_rate = 0.0
             else:
                 self.kalman_yolo_range.predict()
                 self.kalman_yolo_range.correct(measurement)
-                self.yolo_range = float(self.kalman_yolo_range.statePost[0][0])
-                self.yolo_range_rate = float(self.kalman_yolo_range.statePost[1][0])
+
+            self.yolo_range = float(self.kalman_yolo_range.statePost[0][0])
+            self.yolo_range_rate = float(self.kalman_yolo_range.statePost[1][0])
         else:
-            # raw (no Kalman)
             if self.prev_yolo_Z_raw is not None:
                 dt = 1.0 / self.original_fps
                 self.yolo_range_rate = (Z_raw - self.prev_yolo_Z_raw) / dt
@@ -354,24 +382,23 @@ class BallDropTracker:
             self.yolo_range = Z_raw
             self.prev_yolo_Z_raw = Z_raw
 
-        # ====================== PIXEL + REAL VELOCITY (Kalman smoothed) ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ VELOCITY (unchanged) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if self.use_yolo_kalman:
             meas = np.array([[np.float32(center[0])], [np.float32(center[1])]], np.float32)
             if not self.yolo_kalman_initialized:
                 self.kalman_yolo_pixel.statePost = np.array([[center[0]], [center[1]], [0.0], [0.0]], np.float32)
                 self.yolo_kalman_initialized = True
-                self.yolo_pixVelocity = (0.0, 0.0)
             else:
                 self.kalman_yolo_pixel.predict()
                 self.kalman_yolo_pixel.correct(meas)
-                vx_px = self.kalman_yolo_pixel.statePost[2][0] * self.original_fps
-                vy_px = self.kalman_yolo_pixel.statePost[3][0] * self.original_fps
-                self.yolo_pixVelocity = (vx_px, vy_px)
+
+            vx_px = self.kalman_yolo_pixel.statePost[2][0] * self.original_fps
+            vy_px = self.kalman_yolo_pixel.statePost[3][0] * self.original_fps
+            self.yolo_pixVelocity = (vx_px, vy_px)
 
             draw_x = int(self.kalman_yolo_pixel.statePost[0][0])
             draw_y = int(self.kalman_yolo_pixel.statePost[1][0])
         else:
-            # raw velocity
             if self.prev_yolo_centroid is not None:
                 dx = center[0] - self.prev_yolo_centroid[0]
                 dy = center[1] - self.prev_yolo_centroid[1]
@@ -383,14 +410,12 @@ class BallDropTracker:
         self.yolo_centroid = (draw_x, draw_y)
         self.prev_yolo_centroid = center
 
-        # Real-world velocities
         Z_yolo = max(self.yolo_range, 0.1)
         self.yolo_vx_mps = (self.yolo_pixVelocity[0] * Z_yolo) / self.focal_length_px
         self.yolo_vy_mps = (self.yolo_pixVelocity[1] * Z_yolo) / self.focal_length_px
-        # ============================================================================
 
-        # Text on YOLO panel
-        cv2.putText(display_img, f"Range: {self.yolo_range:.2f}m", (30, 65),
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ TEXT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        cv2.putText(display_img, f"Range: {self.yolo_range:.2f}m (bbox)", (30, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
         cv2.putText(display_img, f"vr: {self.yolo_range_rate:+.2f} m/s", (30, 115),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
@@ -400,27 +425,25 @@ class BallDropTracker:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 255, 255), 3)
 
         if self.use_yolo_kalman:
-            cv2.putText(display_img, "YOLO Kalman ON", (30, 245),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 100), 2)
-        
-        # also collect data for plotting
+            cv2.putText(display_img, "YOLO Kalman ON (bbox)", (30, 245),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 100), 2)
+
+        # Data collection
         if self.collectingPlotData:
-            current_time = current_frame_num*1/self.original_fps   # or better: use frame number * (1/FPS)
+            current_time = current_frame_num * 1.0 / self.original_fps
             self.yolo_frame_times.append(current_time)
-            
             self.yolo_pixVelocity_history.append(self.yolo_pixVelocity)
             self.yolo_vx_mps_history.append(self.yolo_vx_mps)
             self.yolo_vy_mps_history.append(self.yolo_vy_mps)
             self.yolo_range_history.append(self.yolo_range)
             self.yolo_range_rate_history.append(self.yolo_range_rate)
-
             
 
 
     # try using the tracking box to help clean up the segmantation of the object
     def segment_ball_in_roi(self, original: np.ndarray, cx: int, cy: int) -> Tuple[Optional[float], Optional[int], Optional[int]]:
         """Crop a box around the tracked centroid and do clean color-based segmentation.
-        Returns (pixel_diam, center_x, center_y) or (None, None, None) if segmentation fails."""
+        Now uses MIN side of bounding box for diameter (more robust to motion blur)."""
 
         box_size = 250
         half = box_size // 2
@@ -430,21 +453,21 @@ class BallDropTracker:
         x2 = min(self.width, cx + half)
         y2 = min(self.height, cy + half)
 
-        # Draw the segmentation ROI (light green) - will be very noisy in its placement since its based on center of weight of moving objects contours
+        # Draw the segmentation ROI
         cv2.rectangle(original, (x1, y1), (x2, y2), (0, 255, 100), 2)
 
         roi = original[y1:y2, x1:x2]
         if roi.size == 0:
             return None, None, None
 
-        # HSV color segmentation for tennis ball
+        # HSV color segmentation for tennis ball (yellow/orange)
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         lower_yellow = np.array([20, 80, 80])
         upper_yellow = np.array([45, 255, 255])
         
         mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-        # Clean up mask
+        # # Clean up mask
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -454,22 +477,26 @@ class BallDropTracker:
             return None, None, None
 
         largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < 50:
+        if cv2.contourArea(largest) < 80:
             return None, None, None
 
-        # Get accurate center and radius using minEnclosingCircle
-        (x, y), radius = cv2.minEnclosingCircle(largest)
-        pixel_diam = 2 * radius
+        x, y, w, h = cv2.boundingRect(largest)
+        pixel_diam = min(w, h)
 
-        # Convert center from ROI coordinates back to original image coordinates
-        center_x = int(x1 + x)
-        center_y = int(y1 + y)
+        # ~~~~~ BETTER CENTER: Use moments instead of bbox center ~~~~~
 
-        # draw the segmented circle - should be very stable
-        cv2.circle(original, (center_x, center_y), int(radius), (255, 0, 255), 2)
+        center_x = int(x1 + x + w / 2)
+        center_y = int(y1 + y + h / 2)
+
+        # Draw bounding box (orange) and a small dot at the moments center (magenta)
+        cv2.rectangle(original, 
+                     (int(x1 + x), int(y1 + y)), 
+                     (int(x1 + x + w), int(y1 + y + h)), 
+                     (0, 165, 255), 2)
+
+        # cv2.circle(original, (center_x, center_y), 5, (255, 0, 255), -1)   # magenta dot for moments center
 
         return pixel_diam, center_x, center_y
-
 
     # process a single frame of video (frame by frame logic here)
     def processNextFrame(self, frame: np.ndarray, current_frame_num: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -482,7 +509,7 @@ class BallDropTracker:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), self.blur_sigma)
 
-        # === Motion processing (frame diff / canny) ===
+        # ~~~~~ Motion processing (frame diff / canny) ~~~~~
         if self.motion_mode == "canny":
             if self.use_opencv_canny:
                 processed = cv2.Canny(blurred, self.canny_low, self.canny_high)
@@ -514,7 +541,7 @@ class BallDropTracker:
         # monocular range and velocity estimation + tracking movement time taken ("classical methods")
         self.current_classicalProcessing_time = about_to_run_yolo_time - begin_processing_frame_time
 
-        # ====================== YOLO (every frame when enabled) ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ YOLO (every frame when enabled) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if self.yolo_enabled and self.yolo_model is not None:
             start_yolo = time.time()
 
@@ -547,8 +574,8 @@ class BallDropTracker:
             self.yolo_annotated = frame_for_yolo
             yolo_time = time.time() - start_yolo
             self.current_yoloProcessing_time = yolo_time
-        # ============================================================================
-        # ============================================================================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~=
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~=
 
         processed_color = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
@@ -622,6 +649,7 @@ class BallDropTracker:
                 weighted_cx += (M["m10"] / M["m00"]) * area
                 weighted_cy += (M["m01"] / M["m00"]) * area
                 total_area += area
+                
 
         if total_area == 0:
             return
@@ -738,7 +766,7 @@ class BallDropTracker:
         cv2.putText(original, status, (20, y_offset + 215),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 255, 100), 2)
         
-        # ====================== DATA COLLECTION FOR PLOTTING ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ DATA COLLECTION FOR PLOTTING ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if self.collectingPlotData:
             current_time = current_frame_num*1/self.original_fps   # or better: use frame number * (1/FPS)
             self.frame_times.append(current_time)
@@ -749,7 +777,7 @@ class BallDropTracker:
             self.range_history.append(self.range)
             self.range_rate_history.append(self.range_rate)
 
-        # =========================================================================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~=
         
 
     # plot the pixVelocity for a single loop of video
@@ -774,7 +802,7 @@ class BallDropTracker:
         # 3-row figure
         fig, axs = plt.subplots(3, 1, figsize=(16, 14), sharex=True)
 
-        # ====================== ROW 1: Pixel Velocities (px/s) ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ROW 1: Pixel Velocities (px/s) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Classical
         axs[0].plot(t_class, [v[1] for v in self.pixVelocity_history], 
                    color='blue', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Vy (px/s)')
@@ -801,9 +829,9 @@ class BallDropTracker:
         axs[0].grid(True, alpha=0.4)
         axs[0].legend(fontsize=11, loc='upper right')
         axs[0].axhline(y=0, color='gray', linestyle='--', alpha=0.6)
-        axs[0].set_ylim(-1000, 1000 )
+        axs[0].set_ylim(-4000, 4000 )
 
-        # ====================== ROW 2: Real-world Velocities (m/s) ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ROW 2: Real-world Velocities (m/s) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Classical
         axs[1].plot(t_class, self.vy_mps_history, color='blue', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Vy (m/s)')
         axs[1].scatter(t_class, self.vy_mps_history, c='blue', s=40, alpha=0.7)
@@ -824,9 +852,9 @@ class BallDropTracker:
         axs[1].grid(True, alpha=0.4)
         axs[1].legend(fontsize=11, loc='upper right')
         axs[1].axhline(y=0, color='gray', linestyle='--', alpha=0.6)
-        axs[1].set_ylim(-3, 3)
+        axs[1].set_ylim(-10, 10)
 
-        # ====================== ROW 3: Range & Range-rate ======================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ROW 3: Range & Range-rate ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         ax1 = axs[2]
 
         # Classical Range
@@ -916,7 +944,7 @@ class BallDropTracker:
                 print("Please set crop with 'x' and 'c' first.")
                 return False
 
-            # === CLEAR EVERYTHING BEFORE STARTING NEW COLLECTION ===
+            # ~~~~~ CLEAR EVERYTHING BEFORE STARTING NEW COLLECTION ~~~~~
             self.collectingPlotData = True
             self.pixVelocity_history.clear()
             self.vx_mps_history.clear()      # add these if you have them
@@ -967,7 +995,7 @@ class BallDropTracker:
             self.roi_bottom = 0
             print("ROI Reset → Full image visible again")
 
-        # ================== 4-sided ROI with Arrow Keys ==================
+        # ~~~~~~~~~~~~~~~~~~~~~~~~= 4-sided ROI with Arrow Keys ~~~~~~~~~~~~~~~~~~~~~~~~=
         elif key == 81:  # Left Arrow
             self.roi_left = min(self.width // 2, self.roi_left + 20)
             print(f"ROI Left: {self.roi_left} px")
@@ -1142,7 +1170,7 @@ class BallDropTracker:
 
             # regular video processing that needs to be done every frame in order to display whats happening
             original_annotated, motion_color = self.processNextFrame(frame, current_frame)
-            # === Build 3-panel display ===
+            # ~~~~~ Build 3-panel display ~~~~~
             if self.yolo_annotated is not None:
                 yolo_display = self.yolo_annotated
             else:
@@ -1190,7 +1218,7 @@ class BallDropTracker:
 
 if __name__ == "__main__":
     # tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260402_111032.mp4")
-    tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260407_075000.mp4")
-    # tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260407_073730.mp4")
+    # tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260407_075000.mp4")
+    tracker = BallDropTracker("/home/npurd/ece_532_actual/ece_532/sandbox/inputVids/20260409_114839.mp4")
     
     tracker.runTheLoop()

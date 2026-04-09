@@ -754,169 +754,125 @@ class BallDropTracker:
 
     # plot the pixVelocity for a single loop of video
     def plot_combined_data(self):
-        """Plot all data in one figure:
-        - Top: Vx and Vy (m/s) limited to ±10 m/s
-        - Bottom: Range (m) and Range-rate (m/s)
-        """
+        """Unified 3-row plot: Pixel Velocities | Real-world Velocities | Range & Range-rate
+        Classical = solid lines + circles
+        YOLO = dashed lines + squares"""
         if len(self.frame_times) < 5:
-            print("Not enough valid data collected (need at least 5 points).")
+            print("Not enough classical data collected (need at least 5 points).")
             return
 
-        # Prepare time axis (relative to start)
-        t = self.frame_times
-        if t:
-            t0 = t[0]
-            t = [ti - t0 for ti in t]
+        # Time axis (shared, relative to first classical frame)
+        t_class = [ti - self.frame_times[0] for ti in self.frame_times]
 
-        # Prepare real-world velocities (m/s)
-        if hasattr(self, 'vx_mps_history') and len(self.vx_mps_history) > 0:
-            vx = self.vx_mps_history
-            vy = self.vy_mps_history
+        if len(self.yolo_frame_times) > 0:
+            t_yolo = [ti - self.frame_times[0] for ti in self.yolo_frame_times]
         else:
-            # Fallback
-            vx = []
-            vy = []
-            avg_range = np.mean(self.range_history) if self.range_history else 2.0
-            for v in self.pixVelocity_history:
-                vx.append((v[0] * avg_range) / self.focal_length_px)
-                vy.append((v[1] * avg_range) / self.focal_length_px)
+            t_yolo = t_class
 
-        print(f"Plotting combined data with {len(t)} points...")
+        print(f"Plotting combined data — Classical: {len(t_class)} pts | YOLO: {len(t_yolo)} pts")
 
-        fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+        # 3-row figure
+        fig, axs = plt.subplots(3, 1, figsize=(16, 14), sharex=True)
 
-        # ====================== TOP PLOT: Vx and Vy (m/s) with Y-limit ±10 ======================
-        axs[0].scatter(t, vy, c='blue', s=40, alpha=0.8, label='Vy (vertical)')
-        axs[0].plot(t, vy, 'b-', linewidth=1.8, alpha=0.7)
+        # ====================== ROW 1: Pixel Velocities (px/s) ======================
+        # Classical
+        axs[0].plot(t_class, [v[1] for v in self.pixVelocity_history], 
+                   color='blue', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Vy (px/s)')
+        axs[0].scatter(t_class, [v[1] for v in self.pixVelocity_history], c='blue', s=40, alpha=0.7)
 
-        axs[0].scatter(t, vx, c='red', s=40, alpha=0.8, label='Vx (horizontal)')
-        axs[0].plot(t, vx, 'r-', linewidth=1.8, alpha=0.7)
+        axs[0].plot(t_class, [v[0] for v in self.pixVelocity_history], 
+                   color='red', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Vx (px/s)')
+        axs[0].scatter(t_class, [v[0] for v in self.pixVelocity_history], c='red', s=40, alpha=0.7)
 
-        axs[0].set_title('Horizontal and Vertical Velocities (limited to ±10 m/s)', 
-                        fontsize=14, fontweight='bold')
-        axs[0].set_ylabel('Velocity (m/s)', fontsize=12)
-        axs[0].grid(True, alpha=0.3)
-        axs[0].legend(fontsize=11)
-        axs[0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        # YOLO
+        if len(self.yolo_pixVelocity_history) > 0:
+            axs[0].plot(t_yolo, [v[1] for v in self.yolo_pixVelocity_history], 
+                       color='cyan', linestyle='--', linewidth=2.5, alpha=0.9, label='YOLO Vy (px/s)')
+            axs[0].scatter(t_yolo, [v[1] for v in self.yolo_pixVelocity_history], 
+                          c='cyan', s=50, alpha=0.85, marker='s')
 
-        # LIMIT Y-AXIS TO ±5 m/s which is about +- 10 miles per hour ( i dont expect fast objects at this point)
-        axs[0].set_ylim(-5, 5)
+            axs[0].plot(t_yolo, [v[0] for v in self.yolo_pixVelocity_history], 
+                       color='magenta', linestyle='--', linewidth=2.5, alpha=0.9, label='YOLO Vx (px/s)')
+            axs[0].scatter(t_yolo, [v[0] for v in self.yolo_pixVelocity_history], 
+                          c='magenta', s=50, alpha=0.85, marker='s')
 
-        # ====================== BOTTOM PLOT: Range and Range-rate ======================
-        ax1 = axs[1]
-        ax1.scatter(t, self.range_history, c='green', s=40, alpha=0.8, label='Range Z (m)')
-        ax1.plot(t, self.range_history, 'g-', linewidth=1.8, alpha=0.7)
-        ax1.set_ylabel('Range (meters)', color='green', fontsize=12)
+        axs[0].set_title('Pixel Velocities (px/s) — Classical vs YOLO', fontsize=15, fontweight='bold')
+        axs[0].set_ylabel('Pixel Velocity (px/s)', fontsize=13)
+        axs[0].grid(True, alpha=0.4)
+        axs[0].legend(fontsize=11, loc='upper right')
+        axs[0].axhline(y=0, color='gray', linestyle='--', alpha=0.6)
+        axs[0].set_ylim(-1000, 1000 )
+
+        # ====================== ROW 2: Real-world Velocities (m/s) ======================
+        # Classical
+        axs[1].plot(t_class, self.vy_mps_history, color='blue', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Vy (m/s)')
+        axs[1].scatter(t_class, self.vy_mps_history, c='blue', s=40, alpha=0.7)
+
+        axs[1].plot(t_class, self.vx_mps_history, color='red', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Vx (m/s)')
+        axs[1].scatter(t_class, self.vx_mps_history, c='red', s=40, alpha=0.7)
+
+        # YOLO
+        if len(self.yolo_vy_mps_history) > 0:
+            axs[1].plot(t_yolo, self.yolo_vy_mps_history, color='cyan', linestyle='--', linewidth=2.5, alpha=0.9, label='YOLO Vy (m/s)')
+            axs[1].scatter(t_yolo, self.yolo_vy_mps_history, c='cyan', s=50, alpha=0.85, marker='s')
+
+            axs[1].plot(t_yolo, self.yolo_vx_mps_history, color='magenta', linestyle='--', linewidth=2.5, alpha=0.9, label='YOLO Vx (m/s)')
+            axs[1].scatter(t_yolo, self.yolo_vx_mps_history, c='magenta', s=50, alpha=0.85, marker='s')
+
+        axs[1].set_title('Real-world Velocities (m/s) — Classical vs YOLO', fontsize=15, fontweight='bold')
+        axs[1].set_ylabel('Velocity (m/s)', fontsize=13)
+        axs[1].grid(True, alpha=0.4)
+        axs[1].legend(fontsize=11, loc='upper right')
+        axs[1].axhline(y=0, color='gray', linestyle='--', alpha=0.6)
+        axs[1].set_ylim(-3, 3)
+
+        # ====================== ROW 3: Range & Range-rate ======================
+        ax1 = axs[2]
+
+        # Classical Range
+        ax1.plot(t_class, self.range_history, color='green', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical Range Z (m)')
+        ax1.scatter(t_class, self.range_history, c='green', s=40, alpha=0.7)
+
+        # YOLO Range
+        if len(self.yolo_range_history) > 0:
+            ax1.plot(t_yolo, self.yolo_range_history, color='lime', linestyle='--', linewidth=2.5, alpha=0.9, label='YOLO Range Z (m)')
+            ax1.scatter(t_yolo, self.yolo_range_history, c='lime', s=50, alpha=0.85, marker='s')
+
+        ax1.set_ylabel('Range (meters)', color='green', fontsize=13)
         ax1.tick_params(axis='y', labelcolor='green')
 
         ax2 = ax1.twinx()
-        ax2.scatter(t, self.range_rate_history, c='purple', s=40, alpha=0.8, label='Range-rate vr (m/s)')
-        ax2.plot(t, self.range_rate_history, 'purple', linewidth=1.8, alpha=0.7)
-        ax2.set_ylabel('Range-rate (m/s)', color='purple', fontsize=12)
+
+        # Classical vr
+        ax2.plot(t_class, self.range_rate_history, color='purple', linestyle='-', linewidth=2.0, alpha=0.85, label='Classical vr (m/s)')
+        ax2.scatter(t_class, self.range_rate_history, c='purple', s=40, alpha=0.7)
+
+        # YOLO vr
+        if len(self.yolo_range_rate_history) > 0:
+            ax2.plot(t_yolo, self.yolo_range_rate_history, color='violet', linestyle='--', linewidth=2.5, alpha=0.9, label='YOLO vr (m/s)')
+            ax2.scatter(t_yolo, self.yolo_range_rate_history, c='violet', s=50, alpha=0.85, marker='s')
+
+        ax2.set_ylabel('Range-rate (m/s)', color='purple', fontsize=13)
         ax2.tick_params(axis='y', labelcolor='purple')
 
-        ax1.set_title('Range and Range-rate', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Time (seconds)', fontsize=12)
+        ax1.set_title('Range and Range-rate Comparison: Classical vs YOLO', fontsize=15, fontweight='bold')
+        ax1.set_xlabel('Time (seconds)', fontsize=13)
         ax1.grid(True, alpha=0.3)
 
-        # Combine legends
+        # Legend
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=11, loc='upper right')
 
         plt.tight_layout()
 
-        # Save the plot
-        plot_filename = f"combined_velocity_range_plot_{time.strftime('%H%M%S')}.png"
-        plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
+        # Save
+        plot_filename = f"combined_classical_vs_yolo_plot_{time.strftime('%H%M%S')}.png"
+        plt.savefig(plot_filename, dpi=220, bbox_inches='tight')
         plt.close()
 
-        print(f"Combined plot saved as: {plot_filename}")
-        print("You can open the PNG file to view Vx/Vy + Range/vr together.\n")
-    
-    
-
-    def plot_YOLOcombined_data(self):
-        """Plot all data in one figure:
-        - Top: Vx and Vy (m/s) limited to ±10 m/s
-        - Bottom: Range (m) and Range-rate (m/s)
-        """
-        if len(self.frame_times) < 5:
-            print("Not enough valid data collected (need at least 5 points).")
-            return
-
-        # Prepare time axis (relative to start)
-        t = self.yolo_frame_times
-        if t:
-            t0 = t[0]
-            t = [ti - t0 for ti in t]
-
-        # Prepare real-world velocities (m/s)
-        if hasattr(self, 'yolo_vx_mps_history') and len(self.yolo_vx_mps_history) > 0:
-            vx = self.yolo_vx_mps_history
-            vy = self.yolo_vy_mps_history
-        else:
-            # Fallback
-            vx = []
-            vy = []
-            avg_range = np.mean(self.yolo_range_history) if self.yolo_range_history else 2.0
-            for v in self.yolo_pixVelocity_history:
-                vx.append((v[0] * avg_range) / self.focal_length_px)
-                vy.append((v[1] * avg_range) / self.focal_length_px)
-
-        print(f"Plotting combined data with {len(t)} points...")
-
-        fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
-
-        # ====================== TOP PLOT: Vx and Vy (m/s) with Y-limit ±10 ======================
-        axs[0].scatter(t, vy, c='blue', s=40, alpha=0.8, label='Vy (vertical)')
-        axs[0].plot(t, vy, 'b-', linewidth=1.8, alpha=0.7)
-
-        axs[0].scatter(t, vx, c='red', s=40, alpha=0.8, label='Vx (horizontal)')
-        axs[0].plot(t, vx, 'r-', linewidth=1.8, alpha=0.7)
-
-        axs[0].set_title('yolo - Horizontal and Vertical Velocities (limited to ±10 m/s)', 
-                        fontsize=14, fontweight='bold')
-        axs[0].set_ylabel('Velocity (m/s)', fontsize=12)
-        axs[0].grid(True, alpha=0.3)
-        axs[0].legend(fontsize=11)
-        axs[0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-
-        # LIMIT Y-AXIS TO ±5 m/s which is about +- 10 miles per hour ( i dont expect fast objects at this point)
-        axs[0].set_ylim(-5, 5)
-
-        # ====================== BOTTOM PLOT: Range and Range-rate ======================
-        ax1 = axs[1]
-        ax1.scatter(t, self.yolo_range_history, c='green', s=40, alpha=0.8, label='Range Z (m)')
-        ax1.plot(t, self.yolo_range_history, 'g-', linewidth=1.8, alpha=0.7)
-        ax1.set_ylabel('Range (meters)', color='green', fontsize=12)
-        ax1.tick_params(axis='y', labelcolor='green')
-
-        ax2 = ax1.twinx()
-        ax2.scatter(t, self.yolo_range_rate_history, c='purple', s=40, alpha=0.8, label='Range-rate vr (m/s)')
-        ax2.plot(t, self.yolo_range_rate_history, 'purple', linewidth=1.8, alpha=0.7)
-        ax2.set_ylabel('Range-rate (m/s)', color='purple', fontsize=12)
-        ax2.tick_params(axis='y', labelcolor='purple')
-
-        ax1.set_title('Range and Range-rate', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Time (seconds)', fontsize=12)
-        ax1.grid(True, alpha=0.3)
-
-        # Combine legends
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=11, loc='upper right')
-
-        plt.tight_layout()
-
-        # Save the plot
-        plot_filename = f"combined_velocity_range_plot_{time.strftime('%H%M%S')}.png"
-        plt.savefig(plot_filename, dpi=200, bbox_inches='tight')
-        plt.close()
-
-        print(f"Combined plot saved as: {plot_filename}")
-        print("You can open the PNG file to view Vx/Vy + Range/vr together.\n")
-    
+        print(f"✅ Combined 3-row plot saved as: {plot_filename}")
+        print("Top = Pixel Vel (px/s) | Middle = Real Vel (m/s) | Bottom = Range & vr\n")
 
     # this is horrible dont look inside
     def handleKeyboard(self, key: int) -> bool:
@@ -1160,7 +1116,6 @@ class BallDropTracker:
                 if self.collectingPlotData and not collecting_just_finished:
                     print(f"Cropped segment completed (reached frame {current_frame})... saving plot!")
                     self.plot_combined_data()
-                    self.plot_YOLOcombined_data()
                     self.collectingPlotData = False
                     collecting_just_finished = True
 
